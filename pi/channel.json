@@ -1,0 +1,41 @@
+{
+  "upstream": "https://github.com/earendil-works/pi.git",
+  "bootstrap": {
+    "version": "1.3.0",
+    "commit": "71023aec1546d6d677a65669c5665c0927ce0dd0"
+  },
+  "patches": [
+    "0001-chat-only-view.patch",
+    "0002-managed-update-channel.patch",
+    "0003-chat-only-settings.patch",
+    "0004-chat-only-internal-errors.patch",
+    "0005-compact-chat-inputs.patch",
+    "0006-agent-status-dock.patch",
+    "0007-jump-to-latest-editor-border.patch"
+  ],
+  "upstreamTests": [
+    "test/chat-transcript.test.ts",
+    "test/managed-update-channel.test.ts",
+    "test/managed-update-routing.test.ts",
+    "test/keybindings.test.ts",
+    "test/assistant-message.test.ts",
+    "test/chat-only-settings.test.ts",
+    "test/settings-manager.test.ts",
+    "test/settings-selector.test.ts",
+    "test/config-schemas.test.ts",
+    "test/suite/regressions/5943-session-start-notify.test.ts",
+    "test/internal-error-visibility.test.ts",
+    "test/interactive-mode-assistant-diagnostics.test.ts",
+    "test/interactive-mode-compaction.test.ts",
+    "test/agent-session-auto-compaction-queue.test.ts",
+    "test/suite/regressions/6647-compaction-retries-transient-stream-drop.test.ts",
+    "test/suite/regressions/9340-9777-auto-compaction-cancellation.test.ts",
+    "test/compact-chat-inputs.test.ts",
+    "test/user-message.test.ts",
+    "test/agent-status-dock.test.ts",
+    "test/jump-to-latest-dock.test.ts",
+    "test/chat-viewport.test.ts",
+    "test/interactive-tui.test.ts",
+    "test/status-indicator.test.ts"
+  ]
+}

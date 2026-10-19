@@ -1,0 +1,943 @@
+diff --git c/packages/coding-agent/src/core/keybindings.ts w/packages/coding-agent/src/core/keybindings.ts
+index 75e540b..c180a61 100644
+--- c/packages/coding-agent/src/core/keybindings.ts
++++ w/packages/coding-agent/src/core/keybindings.ts
+@@ -48,6 +48,7 @@ const APP_KEYBINDINGS = {
+ 	},
+ 	"app.model.select": { defaultKeys: "ctrl+l", description: "Open model selector" },
+ 	"app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
++	"app.transcript.toggle": { defaultKeys: "ctrl+shift+o", description: "Toggle chat-only transcript" },
+ 	"app.thinking.toggle": {
+ 		defaultKeys: "ctrl+t",
+ 		description: "Toggle thinking blocks",
+diff --git c/packages/coding-agent/src/modes/interactive/chat-transcript.ts w/packages/coding-agent/src/modes/interactive/chat-transcript.ts
+new file mode 100644
+index 0000000..417e38d
+--- /dev/null
++++ w/packages/coding-agent/src/modes/interactive/chat-transcript.ts
+@@ -0,0 +1,94 @@
++import { type Component, Container, type TuiMouseEvent } from "@earendil-works/pi-tui";
++import { AssistantMessageComponent } from "./components/assistant-message.ts";
++import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.ts";
++import { UserMessageComponent } from "./components/user-message.ts";
++
++/** Downstream presentation only. `children` always retains the native transcript. */
++export class ChatTranscript extends Container {
++	chatOnly = true;
++	readonly transcriptPositions = new Map<boolean, { top: number; follow: boolean }>();
++	private readonly notices = new WeakSet<Component>();
++	private readonly replacements = new WeakMap<Component, Component | null>();
++
++	private readonly unsettled = new Set<Component>();
++	private running = false;
++	private visible = new Container();
++	private readonly userBoundaries = new Set<number>();
++
++	startUserMessage(): void {
++		this.userBoundaries.add(this.children.length);
++	}
++
++	setQuietReplacement(original: Component, replacement: Component | null): void {
++		this.replacements.set(original, replacement);
++	}
++
++	keepVisible(component: Component): void {
++		this.notices.add(component);
++	}
++
++	beginRun(): void {
++		this.running = true;
++	}
++
++	settle(): boolean {
++		const failed = [...this.unsettled].some((child) => child instanceof AssistantMessageComponent && child.isFailure);
++		this.running = false;
++		this.unsettled.clear();
++		return failed;
++	}
++
++	override addChild(component: Component): void {
++		super.addChild(component);
++		if (this.running && component instanceof AssistantMessageComponent) this.unsettled.add(component);
++	}
++
++	override clear(): void {
++		super.clear();
++		this.transcriptPositions.clear();
++		this.unsettled.clear();
++		this.userBoundaries.clear();
++	}
++
++	override invalidate(): void {
++		super.invalidate();
++		for (const child of this.children) this.replacements.get(child)?.invalidate();
++	}
++
++	override handleMouse(event: TuiMouseEvent): ReturnType<Container["handleMouse"]> {
++		return this.visible.handleMouse(event);
++	}
++
++	override render(width: number): string[] {
++		const finals = new Set<Component>();
++		let last: AssistantMessageComponent | undefined;
++		const finish = () => {
++			if (last?.isFinalReply && !this.unsettled.has(last)) finals.add(last);
++			last = undefined;
++		};
++		for (const [index, child] of this.children.entries()) {
++			if (
++				this.userBoundaries.has(index) ||
++				child instanceof UserMessageComponent ||
++				child instanceof SkillInvocationMessageComponent
++			)
++				finish();
++			if (child instanceof AssistantMessageComponent) last = child;
++		}
++		finish();
++		const children = this.chatOnly
++			? this.children.flatMap((child) => {
++					const replacement = this.replacements.get(child);
++					return replacement === null ? [] : [replacement ?? child];
++				})
++			: this.children;
++		this.visible.children = children.filter((child) => {
++			if (child instanceof AssistantMessageComponent) {
++				child.setChatOnly(this.chatOnly);
++				return !this.chatOnly || finals.has(child) || child.isFailure;
++			}
++			return !this.chatOnly || child instanceof UserMessageComponent || this.notices.has(child);
++		});
++		return this.visible.render(width);
++	}
++}
+diff --git c/packages/coding-agent/src/modes/interactive/components/assistant-message.ts w/packages/coding-agent/src/modes/interactive/components/assistant-message.ts
+index c02e371..4e1cf2b 100644
+--- c/packages/coding-agent/src/modes/interactive/components/assistant-message.ts
++++ w/packages/coding-agent/src/modes/interactive/components/assistant-message.ts
+@@ -20,6 +20,21 @@ export class AssistantMessageComponent extends Container {
+ 	private markdownTransformers: readonly MarkdownTransformer[];
+ 	private lastMessage?: AssistantMessage;
+ 	private hasToolCalls = false;
++	private chatOnly = false;
++
++	get isFailure(): boolean {
++		return ["error", "aborted", "length"].includes(this.lastMessage?.stopReason ?? "");
++	}
++
++	get isFinalReply(): boolean {
++		return this.lastMessage?.stopReason === "stop" && !this.hasToolCalls;
++	}
++
++	setChatOnly(chatOnly: boolean): void {
++		if (this.chatOnly === chatOnly) return;
++		this.chatOnly = chatOnly;
++		if (this.lastMessage) this.updateContent(this.lastMessage);
++	}
+ 	private isStreaming = false;
+ 	private thinkingVisibilityOverrides = new Map<number, boolean>();
+ 
+@@ -96,7 +111,7 @@ export class AssistantMessageComponent extends Container {
+ 		this.contentContainer.clear();
+ 
+ 		const hasVisibleContent = message.content.some(
+-			(c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()),
++			(c) => (c.type === "text" && c.text.trim()) || (!this.chatOnly && c.type === "thinking" && c.thinking.trim()),
+ 		);
+ 
+ 		if (hasVisibleContent) {
+@@ -115,7 +130,7 @@ export class AssistantMessageComponent extends Container {
+ 						transform: createMarkdownTransform("assistant", this.isStreaming, this.markdownTransformers),
+ 					}),
+ 				);
+-			} else if (content.type === "thinking") {
++			} else if (content.type === "thinking" && !this.chatOnly) {
+ 				const thinkingBlocks: string[] = [];
+ 				for (; i < message.content.length; i++) {
+ 					const thinkingContent = message.content[i];
+@@ -184,7 +199,7 @@ export class AssistantMessageComponent extends Container {
+ 			this.contentContainer.addChild(
+ 				new Text(theme.fg("error", "Response was truncated before completion."), this.outputPad, 0),
+ 			);
+-		} else if (!hasToolCalls) {
++		} else if (!hasToolCalls || this.chatOnly) {
+ 			if (message.stopReason === "aborted") {
+ 				const abortMessage =
+ 					message.errorMessage && message.errorMessage !== "Request was aborted"
+diff --git c/packages/coding-agent/src/modes/interactive/interactive-mode.ts w/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index ce23984..097bb31 100644
+--- c/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ w/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -134,6 +134,7 @@ import { loadAllHighlightLanguages } from "../../utils/syntax-highlight.ts";
+ import { ensureTool, type ToolStatus } from "../../utils/tools-manager.ts";
+ import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
+ import { reportBug } from "./bug-report.ts";
++import { ChatTranscript } from "./chat-transcript.ts";
+ import { createChatViewport } from "./chat-viewport.ts";
+ import { ArminComponent } from "./components/armin.ts";
+ import { AssistantMessageComponent } from "./components/assistant-message.ts";
+@@ -454,7 +455,7 @@ export class InteractiveMode {
+ 	private ui: TUI;
+ 	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
+ 	private loadedResourcesContainer: Container;
+-	private chatContainer: Container;
++	private chatContainer: ChatTranscript;
+ 	private documentContainer: Container;
+ 	private transcriptScrollView: TuiLayouts.ScrollView | undefined;
+ 	private fullscreenLayoutRoot: Component | undefined;
+@@ -632,7 +633,7 @@ export class InteractiveMode {
+ 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
+ 		this.headerContainer = new Container();
+ 		this.loadedResourcesContainer = new Container();
+-		this.chatContainer = new Container();
++		this.chatContainer = new ChatTranscript();
+ 		this.documentContainer = new Container();
+ 		this.documentContainer.addChild(this.headerContainer);
+ 		this.documentContainer.addChild(this.loadedResourcesContainer);
+@@ -1035,6 +1036,7 @@ export class InteractiveMode {
+ 						"to cycle models",
+ 					),
+ 					hint("app.model.select", "to select model"),
++					hint("app.transcript.toggle", "to toggle chat-only view"),
+ 					hint("app.tools.expand", "to expand tools"),
+ 					hint("app.thinking.toggle", "to expand thinking"),
+ 					hint("app.editor.external", "for external editor"),
+@@ -1052,6 +1054,7 @@ export class InteractiveMode {
+ 					rawKeyHint(`${keyText("app.clear")}/${keyText("app.exit")}`, "clear/exit"),
+ 					rawKeyHint("/", "commands"),
+ 					rawKeyHint("!", "bash"),
++					hint("app.transcript.toggle", "details"),
+ 					hint("app.tools.expand", "more"),
+ 				].join(theme.fg("muted", " · "));
+ 			const compactOnboarding = () =>
+@@ -2351,7 +2354,9 @@ export class InteractiveMode {
+ 		this.showStatusIndicator(
+ 			new WorkingStatusIndicator(
+ 				this.ui,
+-				this.workingMessage ?? this.defaultWorkingMessage,
++				this.chatContainer.chatOnly
++					? this.defaultWorkingMessage
++					: (this.workingMessage ?? this.defaultWorkingMessage),
+ 				this.workingIndicatorOptions,
+ 				colorFn,
+ 			),
+@@ -2360,7 +2365,7 @@ export class InteractiveMode {
+ 
+ 	private setWorkingVisible(visible: boolean): void {
+ 		this.workingVisible = visible;
+-		if (!visible) {
++		if (!visible && !this.chatContainer.chatOnly) {
+ 			this.clearStatusIndicator("working");
+ 			this.ui.requestRender();
+ 			return;
+@@ -2641,7 +2646,9 @@ export class InteractiveMode {
+ 			setWorkingMessage: (message) => {
+ 				this.workingMessage = message;
+ 				if (this.activeStatusIndicator?.kind === "working") {
+-					this.activeStatusIndicator.setMessage(message ?? this.defaultWorkingMessage);
++					if (!this.chatContainer?.chatOnly) {
++						this.activeStatusIndicator.setMessage(message ?? this.defaultWorkingMessage);
++					}
+ 				}
+ 			},
+ 			setWorkingVisible: (visible) => this.setWorkingVisible(visible),
+@@ -3051,6 +3058,7 @@ export class InteractiveMode {
+ 		const errorMsg = `Extension "${extensionPath}" error: ${error}`;
+ 		const errorText = new ThemedText(() => theme.fg("error", errorMsg), 1, 0);
+ 		this.chatContainer.addChild(errorText);
++		this.chatContainer.keepVisible?.(errorText);
+ 		if (stack) {
+ 			// Show stack trace in dim color, indented
+ 			const stackLines = stack.split("\n").slice(1); // Skip first line (duplicates error message)
+@@ -3109,6 +3117,7 @@ export class InteractiveMode {
+ 		this.ui.onDebug = () => this.handleDebugCommand();
+ 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
+ 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
++		this.defaultEditor.onAction("app.transcript.toggle", () => this.toggleChatOnly());
+ 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
+ 		this.defaultEditor.onAction("app.editor.external", () => void this.handleOpenExternalEditor());
+ 		this.defaultEditor.onAction(
+@@ -3412,9 +3421,29 @@ export class InteractiveMode {
+ 
+ 		this.footer.invalidate();
+ 		this.programStatus.handleEvent(event);
++		if (this.chatContainer?.chatOnly && this.activeStatusIndicator?.kind === "working") {
++			if (event.type === "tool_execution_start") {
++				const name = event.toolName.toLowerCase();
++				const state = /delegate|agent/.test(name)
++					? "Delegating"
++					: /read|search|find|grep|ls/.test(name)
++						? "Reading"
++						: /write|edit/.test(name)
++							? "Writing"
++							: "Running";
++				this.activeStatusIndicator.setMessage(state);
++			} else if (event.type === "message_update") {
++				this.activeStatusIndicator.setMessage(
++					event.assistantMessageEvent.type.startsWith("thinking") ? "Thinking" : "Working",
++				);
++			} else if (event.type === "tool_execution_end") {
++				this.activeStatusIndicator.setMessage("Working");
++			}
++		}
+ 
+ 		switch (event.type) {
+ 			case "agent_start":
++				this.chatContainer.beginRun();
+ 				this.pendingTools.clear();
+ 				// Restore main escape handler if retry handler is still active
+ 				// (retry success event fires later, but we need main handler now)
+@@ -3428,7 +3457,7 @@ export class InteractiveMode {
+ 				if (this.settingsManager.getShowTerminalProgress()) {
+ 					this.ui.terminal.setProgress(true);
+ 				}
+-				if (this.workingVisible) {
++				if (this.workingVisible || this.chatContainer?.chatOnly) {
+ 					if (this.activeStatusIndicator?.kind !== "working") {
+ 						this.showWorkingStatusIndicator();
+ 					}
+@@ -3646,6 +3675,7 @@ export class InteractiveMode {
+ 				const component = this.pendingTools.get(event.toolCallId);
+ 				if (component) {
+ 					component.updateResult({ ...event.result, isError: event.isError, durationMs: event.durationMs });
++					if (event.isError) this.chatContainer.keepVisible(component);
+ 					this.pendingTools.delete(event.toolCallId);
+ 					this.ui.requestRender();
+ 				}
+@@ -3656,7 +3686,7 @@ export class InteractiveMode {
+ 				if (this.settingsManager.getShowTerminalProgress()) {
+ 					this.ui.terminal.setProgress(false);
+ 				}
+-				this.clearStatusIndicator("working");
++				if (!this.chatContainer.chatOnly) this.clearStatusIndicator("working");
+ 				if (this.streamingComponent) {
+ 					this.chatContainer.removeChild(this.streamingComponent);
+ 					this.streamingComponent = undefined;
+@@ -3667,9 +3697,14 @@ export class InteractiveMode {
+ 				this.ui.requestRender();
+ 				break;
+ 
+-			case "agent_settled":
++			case "agent_settled": {
++				const failed = this.chatContainer.settle();
++				this.clearStatusIndicator("working");
++				if (event.aborted && !failed) this.showWarning("Operation aborted");
++				this.ui.requestRender();
+ 				await this.checkShutdownRequested();
+ 				break;
++			}
+ 
+ 			case "compaction_start": {
+ 				if (this.settingsManager.getShowTerminalProgress()) {
+@@ -3735,7 +3770,9 @@ export class InteractiveMode {
+ 					} else {
+ 						this.chatContainer.addChild(new Spacer(1));
+ 						const errorMessage = event.errorMessage;
+-						this.chatContainer.addChild(new ThemedText(() => theme.fg("error", errorMessage), 1, 0));
++						const component = new ThemedText(() => theme.fg("error", errorMessage), 1, 0);
++						this.chatContainer.addChild(component);
++						this.chatContainer.keepVisible?.(component);
+ 					}
+ 				}
+ 				void this.flushCompactionQueue({ willRetry: event.willRetry });
+@@ -3898,6 +3935,7 @@ export class InteractiveMode {
+ 					message.fullOutputPath,
+ 				);
+ 				this.chatContainer.addChild(component);
++				this.preserveBashFailure(component, message.command, message);
+ 				break;
+ 			}
+ 			case "custom": {
+@@ -3939,6 +3977,7 @@ export class InteractiveMode {
+ 			case "system":
+ 				break;
+ 			case "user": {
++				this.chatContainer.startUserMessage?.();
+ 				const textContent = this.getUserMessageText(message);
+ 				if (textContent) {
+ 					if (this.chatContainer.children.length > 0) {
+@@ -3954,6 +3993,16 @@ export class InteractiveMode {
+ 						);
+ 						component.setExpanded(this.toolOutputExpanded);
+ 						this.chatContainer.addChild(component);
++						// Reconstruct the invocation, not the injected skill instructions, in chat-only view.
++						this.chatContainer.setQuietReplacement?.(
++							component,
++							new UserMessageComponent(
++								`/skill:${skillBlock.name}${skillBlock.userMessage ? ` ${skillBlock.userMessage}` : ""}`,
++								this.getMarkdownThemeWithSettings(),
++								this.outputPad,
++								this.getMarkdownTransformers(),
++							),
++						);
+ 						// Render user message separately if present
+ 						if (skillBlock.userMessage) {
+ 							this.chatContainer.addChild(new Spacer(1));
+@@ -3964,6 +4013,7 @@ export class InteractiveMode {
+ 								this.getMarkdownTransformers(),
+ 							);
+ 							this.chatContainer.addChild(userComponent);
++							this.chatContainer.setQuietReplacement?.(userComponent, null);
+ 						}
+ 					} else {
+ 						const userComponent = new UserMessageComponent(
+@@ -4082,6 +4132,7 @@ export class InteractiveMode {
+ 				const component = renderedPendingTools.get(message.toolCallId);
+ 				if (component) {
+ 					component.updateResult(message);
++					if (message.isError) this.chatContainer.keepVisible?.(component);
+ 					renderedPendingTools.delete(message.toolCallId);
+ 				}
+ 			} else {
+@@ -4220,6 +4271,7 @@ export class InteractiveMode {
+ 	}
+ 
+ 	renderInitialMessages(): void {
++		this.chatContainer.transcriptPositions.clear();
+ 		const entries = this.sessionManager.buildContextEntries();
+ 		this.renderSessionEntries(entries, {
+ 			updateFooter: true,
+@@ -4244,17 +4296,17 @@ export class InteractiveMode {
+ 		if (this.chatContainer.children.length > 0) {
+ 			this.chatContainer.addChild(new Spacer(1));
+ 		}
+-		this.chatContainer.addChild(
+-			new ThemedText(
+-				() =>
+-					theme.fg(
+-						"warning",
+-						`This project is not trusted. Project ${CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart pi.`,
+-					),
+-				1,
+-				0,
+-			),
++		const warning = new ThemedText(
++			() =>
++				theme.fg(
++					"warning",
++					`This project is not trusted. Project ${CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart pi.`,
++				),
++			1,
++			0,
+ 		);
++		this.chatContainer.keepVisible(warning);
++		this.chatContainer.addChild(warning);
+ 	}
+ 
+ 	async getUserInput(): Promise<string> {
+@@ -4568,6 +4620,38 @@ export class InteractiveMode {
+ 		}
+ 	}
+ 
++	private toggleChatOnly(): void {
++		const scroll = this.transcriptScrollView;
++		if (scroll) {
++			this.chatContainer.transcriptPositions.set(this.chatContainer.chatOnly, {
++				top: scroll.scrollTop,
++				follow: scroll.isFollowingEnd,
++			});
++		}
++		this.chatContainer.chatOnly = !this.chatContainer.chatOnly;
++		if (this.chatContainer.chatOnly && this.session.isStreaming && !this.activeStatusIndicator) {
++			this.showWorkingStatusIndicator();
++		}
++		if (this.activeStatusIndicator?.kind === "working") {
++			if (!this.chatContainer.chatOnly && !this.workingVisible) this.clearStatusIndicator("working");
++			else {
++				this.activeStatusIndicator.setMessage(
++					this.chatContainer.chatOnly
++						? this.defaultWorkingMessage
++						: (this.workingMessage ?? this.defaultWorkingMessage),
++				);
++			}
++		}
++		if (this.renderer instanceof TuiAltScreen) this.renderer.resetTextSelection();
++		this.ui.invalidate();
++		// Recompute the document height before restoring/clamping the other view's offset.
++		this.ui.renderNow();
++		const position = this.chatContainer.transcriptPositions.get(this.chatContainer.chatOnly);
++		if (!position || position.follow) scroll?.scrollToEnd();
++		else scroll?.scrollTo(position.top, { disableFollow: true });
++		this.ui.requestRender(true);
++	}
++
+ 	private toggleToolOutputExpansion(): void {
+ 		this.setToolsExpanded(!this.toolOutputExpanded);
+ 	}
+@@ -4636,13 +4720,17 @@ export class InteractiveMode {
+ 
+ 	showError(errorMessage: string): void {
+ 		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(new ThemedText(() => theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0));
++		const component = new ThemedText(() => theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0);
++		this.chatContainer.addChild(component);
++		this.chatContainer.keepVisible?.(component);
+ 		this.ui.requestRender();
+ 	}
+ 
+ 	showWarning(warningMessage: string): void {
+ 		this.chatContainer.addChild(new Spacer(1));
+-		this.chatContainer.addChild(new ThemedText(() => theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
++		const component = new ThemedText(() => theme.fg("warning", `Warning: ${warningMessage}`), 1, 0);
++		this.chatContainer.addChild(component);
++		this.chatContainer.keepVisible?.(component);
+ 		this.ui.requestRender();
+ 	}
+ 
+@@ -6904,6 +6992,7 @@ export class InteractiveMode {
+ | \`${cycleThinkingLevel}\` | Cycle thinking level |
+ | \`${cycleModelForward}\` / \`${cycleModelBackward}\` | Cycle models |
+ | \`${selectModel}\` | Open model selector |
++| \`${this.getAppKeyDisplay("app.transcript.toggle")}\` | Toggle chat-only transcript |
+ | \`${expandTools}\` | Toggle tool output expansion |
+ | \`${toggleThinking}\` | Toggle thinking block visibility |
+ | \`${externalEditor}\` | Edit message in external editor |
+@@ -7002,6 +7091,21 @@ export class InteractiveMode {
+ 		this.ui.requestRender();
+ 	}
+ 
++	private preserveBashFailure(
++		component: BashExecutionComponent,
++		command: string,
++		result: { exitCode?: number; cancelled: boolean },
++	): void {
++		if (result.cancelled || (result.exitCode !== undefined && result.exitCode !== 0)) {
++			this.chatContainer.setQuietReplacement(
++				component,
++				new UserMessageComponent(
++					`!${command}\n${result.cancelled ? "Operation cancelled" : `Exit code: ${result.exitCode}`}`,
++				),
++			);
++		}
++	}
++
+ 	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
+ 		const extensionRunner = this.session.extensionRunner;
+ 
+@@ -7043,6 +7147,8 @@ export class InteractiveMode {
+ 				result.fullOutputPath,
+ 			);
+ 
++			this.preserveBashFailure(this.bashComponent, command, result);
++
+ 			// Record the result in session
+ 			this.session.recordBashResult(command, result, { excludeFromContext });
+ 			this.bashComponent = undefined;
+@@ -7083,12 +7189,13 @@ export class InteractiveMode {
+ 					result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
+ 					result.fullOutputPath,
+ 				);
++				this.preserveBashFailure(this.bashComponent, command, result);
+ 			}
+ 		} catch (error) {
+ 			if (this.bashComponent) {
+ 				this.bashComponent.setComplete(undefined, false);
+ 			}
+-			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
++			this.showError(`Bash command !${command} failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+ 		}
+ 
+ 		this.bashComponent = undefined;
+diff --git c/packages/coding-agent/test/chat-transcript.test.ts w/packages/coding-agent/test/chat-transcript.test.ts
+new file mode 100644
+index 0000000..401d566
+--- /dev/null
++++ w/packages/coding-agent/test/chat-transcript.test.ts
+@@ -0,0 +1,398 @@
++import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import type { AssistantMessage } from "@earendil-works/pi-ai";
++import { Container, Text } from "@earendil-works/pi-tui";
++import { beforeEach, describe, expect, test, vi } from "vitest";
++import { defaultEditorTheme } from "../../tui/test/test-themes.ts";
++import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
++import { CONFIG_DIR_NAME } from "../src/config.ts";
++import { KEYBINDINGS, KeybindingsManager } from "../src/core/keybindings.ts";
++import { ChatTranscript } from "../src/modes/interactive/chat-transcript.ts";
++import { createChatViewport } from "../src/modes/interactive/chat-viewport.ts";
++import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
++import { CustomEditor } from "../src/modes/interactive/components/custom-editor.ts";
++import { UserMessageComponent } from "../src/modes/interactive/components/user-message.ts";
++import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
++import { initTheme } from "../src/modes/interactive/theme/theme.ts";
++import { createInteractiveTui } from "../src/modes/interactive/tui-renderer.ts";
++import { stripAnsi } from "../src/utils/ansi.ts";
++
++function message(text: string, stopReason: AssistantMessage["stopReason"] = "stop", tools = false): AssistantMessage {
++	return {
++		role: "assistant",
++		api: "openai-responses",
++		provider: "fake",
++		model: "fake",
++		timestamp: 0,
++		content: [
++			{ type: "thinking", thinking: "SECRET_THOUGHT" },
++			{ type: "text", text },
++			...(tools ? [{ type: "toolCall" as const, id: "call", name: "read", arguments: {} }] : []),
++		],
++		stopReason,
++		usage: {
++			input: 0,
++			output: 0,
++			cacheRead: 0,
++			cacheWrite: 0,
++			totalTokens: 0,
++			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
++		},
++	};
++}
++
++const output = (chat: ChatTranscript, width = 80) => stripAnsi(chat.render(width).join("\n"));
++
++for (const reason of ["error", "aborted", "length"] as const) {
++	test(`keeps ${reason} visible even when it contains a tool call`, () => {
++		initTheme("dark");
++		const chat = new ChatTranscript();
++		chat.beginRun();
++		chat.addChild(new AssistantMessageComponent(message("PARTIAL", reason, true)));
++		expect(output(chat)).toMatch(/Error:|Operation aborted|truncated/);
++		expect(output(chat)).not.toContain("SECRET_THOUGHT");
++		expect(chat.settle()).toBe(true);
++	});
++}
++
++test("permission/error notices survive while unclassified progress rows stay hidden", () => {
++	initTheme("dark");
++	const chat = new ChatTranscript();
++	const error = new Text("ACTIONABLE_ERROR");
++	chat.addChild(error);
++	chat.keepVisible(error);
++	const banner = new Text("SKILL_INSTRUCTIONS");
++	chat.addChild(banner);
++	chat.setQuietReplacement(banner, new UserMessageComponent("/skill:example args"));
++	expect(output(chat)).toContain("ACTIONABLE_ERROR");
++	expect(output(chat)).toContain("/skill:example args");
++	expect(output(chat)).not.toContain("SKILL_INSTRUCTIONS");
++	chat.chatOnly = false;
++	expect(output(chat)).toContain("SKILL_INSTRUCTIONS");
++	expect(output(chat)).not.toContain("/skill:example args");
++});
++
++test("uses a configurable native action, distinct from tools and thinking", () => {
++	expect(KEYBINDINGS["app.transcript.toggle"].defaultKeys).toBe("ctrl+shift+o");
++	const bindings = new KeybindingsManager({ "app.transcript.toggle": "alt+o" });
++	expect(bindings.getKeys("app.transcript.toggle")).toEqual(["alt+o"]);
++	expect(bindings.getKeys("app.thinking.toggle")).toEqual(["ctrl+t"]);
++});
++
++for (const tuiMode of ["regular", "fullscreen"] as const) {
++	test(`real ${tuiMode} renderer never writes unsettled commentary`, async () => {
++		initTheme("dark");
++		const terminal = new VirtualTerminal(60, 12);
++		const chat = new ChatTranscript();
++		const ui = createInteractiveTui({ tuiMode, terminal, showHardwareCursor: false, logDirectory: "/tmp" });
++		ui.addChild(chat);
++		chat.addChild(new UserMessageComponent("INPUT"));
++		chat.beginRun();
++		const component = new AssistantMessageComponent(message("UNSETTLED_COMMENT"));
++		chat.addChild(component);
++		ui.start();
++		try {
++			await terminal.waitForRender();
++			expect(terminal.getViewport().join("\n")).not.toContain("UNSETTLED_COMMENT");
++			chat.addChild(new AssistantMessageComponent(message("FINAL_REPLY")));
++			chat.settle();
++			ui.requestRender();
++			await terminal.waitForRender();
++			expect(terminal.getViewport().join("\n")).toContain("FINAL_REPLY");
++			expect(terminal.getViewport().join("\n")).not.toContain("UNSETTLED_COMMENT");
++			chat.chatOnly = false;
++			ui.requestRender(true);
++			await terminal.waitForRender();
++			expect(terminal.getViewport().join("\n")).toContain("UNSETTLED_COMMENT");
++			chat.chatOnly = true;
++			terminal.resize(40, 14);
++			ui.requestRender(true);
++			await terminal.waitForRender();
++			expect(terminal.getViewport().join("\n")).not.toContain("UNSETTLED_COMMENT");
++		} finally {
++			ui.stop();
++		}
++	});
++}
++
++test("native control keys restore the details viewport without changing Ctrl+T", async () => {
++	initTheme("dark");
++	const terminal = new VirtualTerminal(60, 18);
++	const chat = new ChatTranscript();
++	for (let i = 0; i < 20; i++) {
++		chat.addChild(new UserMessageComponent(`INPUT_${i}`));
++		chat.addChild(new Text(`DETAIL_${i}`));
++		chat.addChild(new AssistantMessageComponent(message(`FINAL_${i}`)));
++	}
++	const ui = createInteractiveTui({
++		tuiMode: "fullscreen",
++		terminal,
++		showHardwareCursor: false,
++		logDirectory: "/tmp",
++	});
++	const bindings = new KeybindingsManager();
++	const editor = new CustomEditor(ui, defaultEditorTheme, bindings);
++	const viewport = createChatViewport({
++		document: chat,
++		pendingMessages: new Container(),
++		status: new Container(),
++		editor,
++		footer: new Container(),
++		scrollbar: "hidden",
++	});
++	const context = {
++		chatContainer: chat,
++		transcriptScrollView: viewport.transcript,
++		session: { isStreaming: false },
++		ui,
++		hideThinkingBlock: false,
++		settingsManager: { setHideThinkingBlock: vi.fn() },
++		updateThinkingBlockVisibility() {
++			Reflect.apply(Reflect.get(InteractiveMode.prototype, "updateThinkingBlockVisibility"), this, []);
++		},
++		showStatus: vi.fn(),
++	};
++	editor.onAction("app.transcript.toggle", () => {
++		Reflect.apply(Reflect.get(InteractiveMode.prototype, "toggleChatOnly"), context, []);
++	});
++	editor.onAction("app.thinking.toggle", () => {
++		Reflect.apply(Reflect.get(InteractiveMode.prototype, "toggleThinkingBlockVisibility"), context, []);
++	});
++	ui.setLayoutRoot(viewport.root);
++	ui.start();
++	try {
++		await terminal.waitForRender();
++		editor.handleInput("\x14"); // Ctrl+T keeps its native setting, even while quiet.
++		expect(context.settingsManager.setHideThinkingBlock).toHaveBeenCalledWith(true);
++		expect(chat.chatOnly).toBe(true);
++		editor.handleInput("\x1b[111;6u"); // Kitty Ctrl+Shift+O
++		await terminal.waitForRender();
++		expect(chat.chatOnly).toBe(false);
++		viewport.transcript.scrollTo(12, { disableFollow: true });
++		ui.renderNow();
++		await terminal.waitForRender();
++		const top = viewport.transcript.scrollTop;
++		const details = terminal.getViewport().join("\n");
++		expect(details).toContain("DETAIL_");
++		editor.handleInput("\x1b[111;6u");
++		await terminal.waitForRender();
++		expect(terminal.getViewport().join("\n")).not.toContain("DETAIL_");
++		editor.handleInput("\x1b[111;6u");
++		await terminal.waitForRender();
++		expect(viewport.transcript.scrollTop).toBe(top);
++		expect(viewport.transcript.isFollowingEnd).toBe(false);
++		expect(terminal.getViewport().join("\n")).toBe(details);
++
++		// Navigation replaces the transcript; old details offsets must not survive it.
++		Reflect.apply(
++			Reflect.get(InteractiveMode.prototype, "rebuildChatFromMessages"),
++			{
++				...context,
++				sessionManager: { buildContextEntries: () => [] },
++				renderSessionEntries: () => {
++					for (let i = 0; i < 30; i++) chat.addChild(new UserMessageComponent(`NEW_BRANCH_${i}`));
++				},
++			},
++			[],
++		);
++		expect(chat.transcriptPositions.size).toBe(0);
++		viewport.transcript.scrollToEnd();
++		editor.handleInput("\x1b[111;6u");
++		await terminal.waitForRender();
++		editor.handleInput("\x1b[111;6u");
++		await terminal.waitForRender();
++		expect(viewport.transcript.isFollowingEnd).toBe(true);
++		expect(terminal.getViewport().join("\n")).toContain("NEW_BRANCH_29");
++	} finally {
++		ui.stop();
++	}
++});
++
++test("settlement releases only the final and reports cancellation without an assistant failure", async () => {
++	initTheme("dark");
++	const chat = new ChatTranscript();
++	chat.beginRun();
++	chat.addChild(new AssistantMessageComponent(message("FINAL_AT_SETTLEMENT")));
++	const context = {
++		isInitialized: true,
++		chatContainer: chat,
++		footer: { invalidate: vi.fn() },
++		programStatus: { handleEvent: vi.fn() },
++		clearStatusIndicator: vi.fn(),
++		showWarning: vi.fn(),
++		ui: { requestRender: vi.fn() },
++		checkShutdownRequested: vi.fn(),
++	};
++	expect(output(chat)).not.toContain("FINAL_AT_SETTLEMENT");
++	await Reflect.apply(Reflect.get(InteractiveMode.prototype, "handleEvent"), context, [
++		{ type: "agent_settled", aborted: true },
++	]);
++	expect(output(chat)).toContain("FINAL_AT_SETTLEMENT");
++	expect(context.clearStatusIndicator).toHaveBeenCalledWith("working");
++	expect(context.showWarning).toHaveBeenCalledWith("Operation aborted");
++});
++
++for (const cancelled of [false, true]) {
++	for (const path of ["live", "intercepted", "replay"] as const) {
++		test(`${path} keeps a concise user bash ${cancelled ? "cancellation" : "failure"}`, async () => {
++			initTheme("dark");
++			const chat = new ChatTranscript();
++			const result = { output: "HUGE_BASH_OUTPUT\n".repeat(100), exitCode: cancelled ? undefined : 1, cancelled };
++			const context = {
++				chatContainer: chat,
++				outputPad: 1,
++				ui: { requestRender: vi.fn() },
++				sessionManager: { getCwd: () => "/tmp" },
++				session: {
++					isStreaming: false,
++					extensionRunner: { emitUserBash: async () => (path === "intercepted" ? { result } : undefined) },
++					executeBash: vi.fn(async (_command: string, onChunk: (chunk: string) => void) => {
++						onChunk(result.output);
++						return result;
++					}),
++					recordBashResult: vi.fn(),
++				},
++				preserveBashFailure: Reflect.get(InteractiveMode.prototype, "preserveBashFailure"),
++			};
++			if (path === "replay") {
++				Reflect.apply(Reflect.get(InteractiveMode.prototype, "addMessageToChat"), context, [
++					{ role: "bashExecution", command: "false", ...result },
++				]);
++			} else {
++				await Reflect.apply(Reflect.get(InteractiveMode.prototype, "handleBashCommand"), context, ["false"]);
++			}
++			expect(output(chat)).toContain("!false");
++			expect(output(chat)).toContain(cancelled ? "Operation cancelled" : "Exit code: 1");
++			expect(output(chat)).not.toContain("HUGE_BASH_OUTPUT");
++			chat.chatOnly = false;
++			expect(output(chat)).toContain("HUGE_BASH_OUTPUT");
++		});
++	}
++}
++
++test("startup preserves the project trust warning in quiet mode", () => {
++	initTheme("dark");
++	const cwd = mkdtempSync(join(tmpdir(), "pi-chat-trust-"));
++	try {
++		mkdirSync(join(cwd, CONFIG_DIR_NAME, "skills"), { recursive: true });
++		const chat = new ChatTranscript();
++		chat.transcriptPositions.set(false, { top: 99, follow: false });
++		const context = {
++			chatContainer: chat,
++			sessionManager: { buildContextEntries: () => [], getEntries: () => [], getCwd: () => cwd },
++			settingsManager: { isProjectTrusted: () => false },
++			renderSessionEntries: vi.fn(),
++			renderProjectTrustWarningIfNeeded: Reflect.get(InteractiveMode.prototype, "renderProjectTrustWarningIfNeeded"),
++		};
++		Reflect.apply(InteractiveMode.prototype.renderInitialMessages, context, []);
++		expect(output(chat)).toContain("This project is not trusted");
++		expect(output(chat)).toContain("/trust");
++		expect(chat.transcriptPositions.size).toBe(0);
++	} finally {
++		rmSync(cwd, { recursive: true, force: true });
++	}
++});
++
++test("active quiet spinner survives a hidden-working details roundtrip", () => {
++	const chat = new ChatTranscript();
++	const indicator = { kind: "working", setMessage: vi.fn() };
++	const context = {
++		chatContainer: chat,
++		session: { isStreaming: true },
++		workingVisible: false,
++		defaultWorkingMessage: "Working",
++		activeStatusIndicator: indicator as typeof indicator | undefined,
++		clearStatusIndicator: vi.fn(() => {
++			context.activeStatusIndicator = undefined;
++		}),
++		showWorkingStatusIndicator: vi.fn(() => {
++			context.activeStatusIndicator = indicator;
++		}),
++		ui: { invalidate: vi.fn(), renderNow: vi.fn(), requestRender: vi.fn() },
++	};
++	const toggle = () => Reflect.apply(Reflect.get(InteractiveMode.prototype, "toggleChatOnly"), context, []);
++	toggle();
++	expect(context.activeStatusIndicator).toBeUndefined();
++	toggle();
++	expect(context.showWorkingStatusIndicator).toHaveBeenCalledOnce();
++	expect(context.activeStatusIndicator).toBe(indicator);
++	expect(indicator.setMessage).toHaveBeenLastCalledWith("Working");
++});
++
++describe("downstream chat-only transcript", () => {
++	beforeEach(() => initTheme("dark"));
++
++	test("replay selects one final per user, not per tool round or continuation", () => {
++		const chat = new ChatTranscript();
++		chat.addChild(new UserMessageComponent("FIRST_INPUT"));
++		chat.addChild(new AssistantMessageComponent(message("TOOL_COMMENT", "toolUse", true)));
++		chat.addChild(new Text("TOOL_RESULT_OR_AGENT_PROGRESS"));
++		chat.addChild(new AssistantMessageComponent(message("INTERMEDIATE_STOP")));
++		chat.addChild(new AssistantMessageComponent(message("FIRST_FINAL")));
++		chat.addChild(new UserMessageComponent("SECOND_INPUT"));
++		chat.addChild(new AssistantMessageComponent(message("SECOND_FINAL")));
++		const original = [...chat.children];
++		const quiet = output(chat);
++		for (const text of ["FIRST_INPUT", "SECOND_INPUT", "FIRST_FINAL", "SECOND_FINAL"]) expect(quiet).toContain(text);
++		for (const text of ["TOOL_COMMENT", "TOOL_RESULT", "INTERMEDIATE_STOP", "SECRET_THOUGHT", "Thinking..."])
++			expect(quiet).not.toContain(text);
++		chat.chatOnly = false;
++		expect(output(chat)).toContain("TOOL_COMMENT");
++		expect(output(chat)).toContain("TOOL_RESULT_OR_AGENT_PROGRESS");
++		expect(output(chat)).toContain("SECRET_THOUGHT");
++		expect(chat.children).toEqual(original);
++		chat.chatOnly = true;
++		expect(output(chat)).toBe(quiet);
++	});
++
++	test("native replay rebuilds the selected branch, including textless user boundaries", () => {
++		const chat = new ChatTranscript();
++		const context = {
++			chatContainer: chat,
++			hideThinkingBlock: false,
++			outputPad: 1,
++			preserveBashFailure: Reflect.get(InteractiveMode.prototype, "preserveBashFailure"),
++			getUserMessageText: Reflect.get(InteractiveMode.prototype, "getUserMessageText"),
++			getMarkdownThemeWithSettings: () => undefined,
++			getMarkdownTransformers: () => [],
++		};
++		const replay = (entry: object) =>
++			Reflect.apply(Reflect.get(InteractiveMode.prototype, "addMessageToChat"), context, [entry]);
++		replay({ role: "user", content: "RESUMED_INPUT" });
++		replay(message("RESUMED_INTERIM"));
++		replay(message("RESUMED_FINAL"));
++		replay({ role: "user", content: [] });
++		replay(message("IMAGE_TURN_FINAL"));
++		expect(output(chat)).toContain("RESUMED_FINAL");
++		expect(output(chat)).toContain("IMAGE_TURN_FINAL");
++		expect(output(chat)).not.toContain("RESUMED_INTERIM");
++		chat.clear();
++		replay({ role: "user", content: "TREE_BRANCH_INPUT" });
++		replay(message("TREE_BRANCH_FINAL"));
++		expect(output(chat)).toContain("TREE_BRANCH_FINAL");
++		expect(output(chat)).not.toContain("RESUMED_FINAL");
++	});
++
++	test("does not flash a completed intermediate response before settlement", () => {
++		const chat = new ChatTranscript();
++		chat.addChild(new UserMessageComponent("INPUT"));
++		chat.beginRun();
++		const draft = message("DRAFT", "pending");
++		const component = new AssistantMessageComponent();
++		chat.addChild(component);
++		component.updateContent(draft, true);
++		expect(output(chat)).not.toContain("DRAFT");
++		component.updateContent(message("INTERIM"), false);
++		expect(output(chat)).not.toContain("INTERIM");
++		chat.chatOnly = false;
++		expect(output(chat)).toContain("INTERIM");
++		chat.chatOnly = true;
++		chat.addChild(new AssistantMessageComponent(message("ACTUAL_FINAL")));
++		expect(output(chat)).not.toContain("ACTUAL_FINAL");
++		chat.settle();
++		expect(output(chat)).toContain("ACTUAL_FINAL");
++		expect(output(chat)).not.toContain("INTERIM");
++		expect(draft.content[0]).toEqual({ type: "thinking", thinking: "SECRET_THOUGHT" });
++	});
++});

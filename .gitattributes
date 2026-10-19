@@ -1,0 +1,2 @@
+# Unified diffs contain intentional context prefixes on otherwise empty lines.
+pi/patches/*.patch -whitespace

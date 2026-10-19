@@ -1,0 +1,300 @@
+diff --git a/packages/coding-agent/src/modes/interactive/chat-transcript.ts b/packages/coding-agent/src/modes/interactive/chat-transcript.ts
+index a68b295..6ec2582 100644
+--- a/packages/coding-agent/src/modes/interactive/chat-transcript.ts
++++ b/packages/coding-agent/src/modes/interactive/chat-transcript.ts
+@@ -1,4 +1,4 @@
+-import { type Component, Container, type TuiMouseEvent } from "@earendil-works/pi-tui";
++import { type Component, Container, Spacer, stripTerminalSequences, type TuiMouseEvent } from "@earendil-works/pi-tui";
+ import { AssistantMessageComponent } from "./components/assistant-message.ts";
+ import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.ts";
+ import { UserMessageComponent } from "./components/user-message.ts";
+@@ -85,13 +85,32 @@ export class ChatTranscript extends Container {
+ 					return replacement === null ? [] : [replacement ?? child];
+ 				})
+ 			: this.children;
+-		this.visible.children = children.filter((child) => {
++		const visible = children.filter((child) => {
++			if (child instanceof UserMessageComponent) child.setChatOnly(this.chatOnly);
+ 			if (child instanceof AssistantMessageComponent) {
+ 				child.setChatOnly(this.chatOnly);
+ 				return !this.chatOnly || finals.has(child);
+ 			}
+ 			return !this.chatOnly || child instanceof UserMessageComponent || this.notices.has(child);
+ 		});
++		if (!this.chatOnly) {
++			this.visible.children = visible;
++			return this.visible.render(width);
++		}
++		this.visible.children = [];
++		let hasContent = false;
++		let endsWithBlank = false;
++		for (const child of visible) {
++			const lines = child.render(width);
++			if (child instanceof UserMessageComponent && lines.length > 0 && hasContent && !endsWithBlank) {
++				this.visible.addChild(new Spacer(1));
++			}
++			this.visible.addChild(child);
++			if (lines.length > 0) {
++				hasContent = true;
++				endsWithBlank = stripTerminalSequences(lines[lines.length - 1]).trim() === "";
++			}
++		}
+ 		return this.visible.render(width);
+ 	}
+ }
+diff --git a/packages/coding-agent/src/modes/interactive/components/user-message.ts b/packages/coding-agent/src/modes/interactive/components/user-message.ts
+index c187eff..90e3a13 100644
+--- a/packages/coding-agent/src/modes/interactive/components/user-message.ts
++++ b/packages/coding-agent/src/modes/interactive/components/user-message.ts
+@@ -1,4 +1,4 @@
+-import { Container, Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
++import { Container, Markdown, type MarkdownTheme, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+ import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
+ import { getMarkdownTheme, theme } from "../theme/theme.ts";
+ import { createMarkdownTransform } from "./markdown-transform.ts";
+@@ -11,6 +11,7 @@ const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+  * Component that renders a user message
+  */
+ export class UserMessageComponent extends Container {
++	private chatOnly = false;
+ 	private text: string;
+ 	private markdownTheme: MarkdownTheme;
+ 	private outputPad: number;
+@@ -30,11 +31,23 @@ export class UserMessageComponent extends Container {
+ 		this.rebuild();
+ 	}
+ 
++	setChatOnly(chatOnly: boolean): void {
++		if (this.chatOnly === chatOnly) return;
++		this.chatOnly = chatOnly;
++		this.rebuild();
++	}
++
+ 	setOutputPad(padding: number): void {
++		if (this.outputPad === padding) return;
+ 		this.outputPad = padding;
+ 		this.rebuild();
+ 	}
+ 
++	override invalidate(): void {
++		// Markdown also caches the foreground prefix used after inline formatting.
++		this.rebuild();
++	}
++
+ 	private rebuild(): void {
+ 		this.clear();
+ 		// The Markdown pads and colors its own background: a Box around it would keep a second full-width copy of every
+@@ -42,8 +55,8 @@ export class UserMessageComponent extends Container {
+ 		this.addChild(
+ 			new Markdown(
+ 				this.text,
+-				this.outputPad,
+-				1,
++				this.chatOnly ? 0 : this.outputPad,
++				this.chatOnly ? 0 : 1,
+ 				this.markdownTheme,
+ 				{
+ 					color: (content: string) => theme.fg("userMessageText", content),
+@@ -59,7 +72,26 @@ export class UserMessageComponent extends Container {
+ 	}
+ 
+ 	override render(width: number): string[] {
+-		const lines = super.render(width);
++		const prefix = "› ";
++		const prefixWidth = visibleWidth(prefix);
++		// Reserve two content columns for wide graphemes; width 1 physically cannot display them.
++		const inlinePrefix = width >= prefixWidth + 2;
++		const padding = this.chatOnly
++			? Math.min(this.outputPad, Math.max(0, Math.floor((width - (inlinePrefix ? prefixWidth : 0) - 2) / 2)))
++			: 0;
++		const contentWidth = this.chatOnly ? Math.max(1, width - (inlinePrefix ? prefixWidth : 0) - padding * 2) : width;
++		let lines = super.render(contentWidth);
++		if (this.chatOnly && lines.length > 0) {
++			lines = lines.map((line, index) => {
++				const role = inlinePrefix ? (index === 0 ? theme.fg("accent", prefix) : " ".repeat(prefixWidth)) : "";
++				return theme.bg(
++					"userMessageBg",
++					role + " ".repeat(padding) + truncateToWidth(line, contentWidth, "") + " ".repeat(padding),
++				);
++			});
++			if (!inlinePrefix)
++				lines.unshift(theme.bg("userMessageBg", theme.fg("accent", truncateToWidth(prefix, width, ""))));
++		}
+ 		if (lines.length === 0) {
+ 			return lines;
+ 		}
+diff --git a/packages/coding-agent/test/compact-chat-inputs.test.ts b/packages/coding-agent/test/compact-chat-inputs.test.ts
+new file mode 100644
+index 0000000..b2fc7c5
+--- /dev/null
++++ b/packages/coding-agent/test/compact-chat-inputs.test.ts
+@@ -0,0 +1,154 @@
++import { fauxAssistantMessage } from "@earendil-works/pi-ai";
++import { Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
++import { beforeEach, expect, test, vi } from "vitest";
++import { ChatTranscript } from "../src/modes/interactive/chat-transcript.ts";
++import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
++import { UserMessageComponent } from "../src/modes/interactive/components/user-message.ts";
++import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.ts";
++import { stripAnsi } from "../src/utils/ansi.ts";
++
++const plain = (lines: string[]) => lines.map((line) => stripAnsi(line).trimEnd());
++beforeEach(() => initTheme("dark"));
++
++test("transcript separates visible turns once without restoring tool spacers or changing native children", () => {
++	const chat = new ChatTranscript();
++	const first = new UserMessageComponent("first", undefined, 0);
++	const second = new UserMessageComponent("second", undefined, 0);
++	chat.addChild(new Spacer(5));
++	chat.addChild(new Text("SECRET_TOOL"));
++	chat.addChild(first);
++	chat.addChild(new AssistantMessageComponent(fauxAssistantMessage("reply")));
++	chat.addChild(new Spacer(5));
++	chat.addChild(second);
++	const native = [...chat.children];
++	const compact = chat.render(80);
++	expect(plain(compact)).toEqual(["› first", "", " reply", "", "› second"]);
++	const gap = plain(compact).indexOf("› second") - 1;
++	expect(compact[gap]).toBe("");
++	expect(chat.render(80)).toEqual(compact);
++	chat.chatOnly = false;
++	chat.render(80);
++	expect(first.render(80)).toEqual(new UserMessageComponent("first", undefined, 0).render(80));
++	chat.chatOnly = true;
++	expect(chat.render(80)).toEqual(compact);
++	expect(chat.children).toEqual(native);
++	chat.clear();
++	chat.addChild(new UserMessageComponent("replay", undefined, 0));
++	expect(plain(chat.render(80))).toEqual(["› replay"]);
++});
++
++test("consecutive users, replacements, empty children and visible notices have bounded spacing", () => {
++	const chat = new ChatTranscript();
++	const hidden = new Text("SECRET_TRACE");
++	chat.addChild(hidden);
++	chat.setQuietReplacement(hidden, new UserMessageComponent("replacement", undefined, 0));
++	chat.addChild(new UserMessageComponent("", undefined, 0));
++	chat.addChild(new UserMessageComponent("next", undefined, 0));
++	const notice = new Text("notice\n", 0, 0);
++	chat.addChild(notice);
++	chat.keepVisible(notice);
++	chat.addChild(new UserMessageComponent("last", undefined, 0));
++	expect(plain(chat.render(80))).toEqual(["› replacement", "", "› next", "notice", "", "› last"]);
++});
++
++test("detailed transcript renders every native child only once", () => {
++	const chat = new ChatTranscript();
++	const children = [
++		new UserMessageComponent("input"),
++		new AssistantMessageComponent(fauxAssistantMessage("reply")),
++		new Text("tool", 0, 0),
++		new Spacer(1),
++	];
++	for (const child of children) chat.addChild(child);
++	chat.render(80);
++	const renders = children.map((child) => vi.spyOn(child, "render"));
++	chat.chatOnly = false;
++	expect(plain(chat.render(80)).join("\n")).toContain("tool");
++	for (const render of renders) expect(render).toHaveBeenCalledExactlyOnceWith(80);
++	expect(chat.children).toEqual(children);
++});
++
++for (const padding of [0, 1]) {
++	for (const width of [2, 3, 4, 5, 6]) {
++		test(`compact input retains wide graphemes at width ${width}, horizontal padding ${padding}`, () => {
++			const source = "世界👩‍💻👨‍👩‍👧‍👦e\u0301";
++			const component = new UserMessageComponent(source, undefined, padding);
++			const stock = component.render(width);
++			component.setChatOnly(true);
++			const lines = component.render(width);
++			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
++			expect(plain(lines).join("").replaceAll(" ", "").replace("›", "")).toBe(source);
++			for (const marker of ["A", "B", "C"]) {
++				expect(lines.join("").split(`\x1b]133;${marker}\x07`)).toHaveLength(2);
++			}
++			expect(lines[0]).toContain("\x1b]133;A\x07");
++			expect(lines.at(-1)).toContain("\x1b]133;B\x07\x1b]133;C\x07");
++			component.setChatOnly(false);
++			expect(component.render(width)).toEqual(stock);
++		});
++	}
++	for (const width of [1, 2, 3, 4, 5, 6, 8, 80]) {
++		test(`compact input fits width ${width}, horizontal padding ${padding}`, () => {
++			const component = new UserMessageComponent(
++				"hello 世界 e\u0301\nnext\n\n```ts\nconst x = 1;\n```",
++				undefined,
++				padding,
++			);
++			const stock = component.render(width);
++			component.setChatOnly(true);
++			const lines = component.render(width);
++			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
++			expect(plain(lines)[0]).toMatch(/^›/);
++			if (width >= 4) {
++				for (const line of plain(lines).slice(1)) expect(line === "" || line.startsWith("  ")).toBe(true);
++			}
++			if (width >= 8) {
++				const text = plain(lines).join("").replaceAll(" ", "");
++				expect(text).toContain("hello世界e\u0301");
++			}
++			expect(lines[0]).toContain("\x1b]133;A\x07");
++			expect(lines.at(-1)).toContain("\x1b]133;B\x07\x1b]133;C\x07");
++			expect(component.render(width)).toEqual(lines);
++			component.setChatOnly(false);
++			expect(component.render(width)).toEqual(stock);
++		});
++	}
++}
++
++test("single-line input has no colored vertical padding; Markdown and transformers keep the original source", () => {
++	const source =
++		"# Heading\n\n**bold** and `code` [link](https://example.com)\n\n7. item\n\n```ts\nconst x = 1;\n```\n\n[attachment: photo.png]";
++	const transform = vi.fn((text: string) => text);
++	const bold = vi.fn((text: string) => text);
++	const component = new UserMessageComponent(source, { ...getMarkdownTheme(), bold }, 0, [transform]);
++	component.setChatOnly(true);
++	const lines = component.render(80);
++	expect(transform).toHaveBeenCalledWith(source, { messageType: "user", isStreaming: false, availableWidth: 78 });
++	expect(plain(lines).join("\n")).toContain("› Heading");
++	for (const text of ["bold", "code", "link", "7. item", "const x = 1;", "[attachment: photo.png]"]) {
++		expect(plain(lines).join("\n")).toContain(text);
++	}
++	expect(bold).toHaveBeenCalledWith(expect.stringContaining("bold"));
++	component.setChatOnly(true);
++	component.setOutputPad(0);
++	component.render(80);
++	expect(transform).toHaveBeenCalledTimes(1);
++	const single = new UserMessageComponent("hello", undefined, 0);
++	single.setChatOnly(true);
++	expect(plain(single.render(80))).toEqual(["› hello"]);
++});
++
++test("theme invalidation refreshes compact formatting and retains stock layout on return", () => {
++	const component = new UserMessageComponent("**bold** tail\nnext", undefined, 0);
++	component.setChatOnly(true);
++	const dark = component.render(80);
++	initTheme("light");
++	component.invalidate();
++	const fresh = new UserMessageComponent("**bold** tail\nnext", undefined, 0);
++	fresh.setChatOnly(true);
++	expect(component.render(80)).toEqual(fresh.render(80));
++	expect(plain(component.render(80))).toEqual(plain(dark));
++	expect(component.render(80)).not.toEqual(dark);
++	component.setChatOnly(false);
++	expect(component.render(80)).toEqual(new UserMessageComponent("**bold** tail\nnext", undefined, 0).render(80));
++});
+diff --git a/packages/coding-agent/test/internal-error-visibility.test.ts b/packages/coding-agent/test/internal-error-visibility.test.ts
+index def98ef..f566b4e 100644
+--- a/packages/coding-agent/test/internal-error-visibility.test.ts
++++ b/packages/coding-agent/test/internal-error-visibility.test.ts
+@@ -98,7 +98,9 @@ for (const tuiMode of ["regular", "fullscreen"] as const) {
+ 						});
+ 					} else invoke(context, "renderSessionItems", [call, result]);
+ 					expect(messages).toEqual(original);
+-					expect(chat.render(100)).toEqual(new UserMessageComponent("INPUT").render(100));
++					const expectedInput = new UserMessageComponent("INPUT");
++					expectedInput.setChatOnly(true);
++					expect(chat.render(100)).toEqual(expectedInput.render(100));
+ 					await terminal.waitForRender();
+ 					expect(terminal.getViewport().join("\n")).not.toContain(text);
+ 				}

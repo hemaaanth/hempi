@@ -1,0 +1,639 @@
+diff --git i/packages/coding-agent/src/modes/interactive/agent-status-dock.ts w/packages/coding-agent/src/modes/interactive/agent-status-dock.ts
+new file mode 100644
+index 0000000..6a88f33
+--- /dev/null
++++ w/packages/coding-agent/src/modes/interactive/agent-status-dock.ts
+@@ -0,0 +1,111 @@
++import {
++	type Component,
++	isViewportTUI,
++	type OverlayHandle,
++	sliceByColumn,
++	type TUI,
++	type TuiMouseEvent,
++	truncateToWidth,
++	visibleWidth,
++} from "@earendil-works/pi-tui";
++
++/** Private hempi.agent-panel contract: header first, then logical body rows 1..N. */
++export class AgentStatusDock implements Component {
++	private lines: string[] = [];
++	private bodyLeft = 0;
++	private bodyStart = 1;
++	private overlay: OverlayHandle | undefined;
++
++	private readonly panel: Component;
++	private readonly ui: TUI;
++	private readonly status: (width: number) => string;
++	constructor(panel: Component, ui: TUI, status: (width: number) => string) {
++		this.panel = panel;
++		this.ui = ui;
++		this.status = status;
++	}
++
++	private refresh(): void {
++		this.lines = this.panel.render(this.ui.terminal.columns);
++		const body = this.lines.slice(1).filter((line) => visibleWidth(line) > 0);
++		this.bodyLeft = body.length ? Math.min(...body.map((line) => line.match(/^ */)![0].length)) : 0;
++	}
++
++	private get bottom(): number {
++		const bounds = isViewportTUI(this.ui) ? this.ui.getComponentBounds(this) : undefined;
++		return bounds ? this.ui.terminal.rows - bounds.row : this.ui.terminal.rows;
++	}
++
++	showOverlay(): void {
++		this.hideOverlay();
++		const dock = this;
++		this.overlay = this.ui.showOverlay(
++			{
++				render(width) {
++					const capacity = Math.max(0, dock.ui.terminal.rows - dock.bottom);
++					dock.bodyStart = Math.max(1, dock.lines.length - capacity);
++					return dock.lines.slice(dock.bodyStart).map((line) => sliceByColumn(line, dock.bodyLeft, width));
++				},
++				handleMouse(event) {
++					return dock.mouse(event, event.x + dock.bodyLeft, event.y + dock.bodyStart);
++				},
++				invalidate: () => dock.invalidate(),
++			},
++			{
++				anchor: "bottom-right",
++				background: true,
++				get width() {
++					return Math.max(1, dock.ui.terminal.columns - dock.bodyLeft);
++				},
++				get margin() {
++					return { bottom: dock.bottom };
++				},
++				nonCapturing: true,
++				visible: () => {
++					dock.refresh();
++					return dock.ui.mode === "fullscreen" && dock.lines.length > 1 && dock.bottom < dock.ui.terminal.rows;
++				},
++			},
++		);
++	}
++
++	hideOverlay(): void {
++		this.overlay?.hide();
++		this.overlay = undefined;
++	}
++
++	invalidate(): void {
++		this.panel.invalidate();
++	}
++
++	render(width: number): string[] {
++		this.refresh();
++		const header = this.lines[0] ?? "";
++		const indent = header.match(/^ */)![0].length;
++		const right = header.slice(indent);
++		const rightWidth = visibleWidth(right);
++		const left = truncateToWidth(
++			this.status(Math.max(0, width - rightWidth - 1)),
++			Math.max(0, width - rightWidth - 1),
++			"",
++		);
++		const row = left + " ".repeat(Math.max(0, width - visibleWidth(left) - rightWidth)) + right;
++		return this.ui.mode === "fullscreen" ? [row] : [...this.lines.slice(1), row];
++	}
++
++	private mouse(event: TuiMouseEvent, x: number, y: number) {
++		const result = this.panel.handleMouse?.({
++			...event,
++			x,
++			y,
++			width: this.ui.terminal.columns,
++			height: this.lines.length,
++		});
++		return result ? { ...result, focus: false } : undefined;
++	}
++
++	handleMouse(event: TuiMouseEvent) {
++		const y = this.ui.mode === "fullscreen" ? 0 : event.y === this.lines.length - 1 ? 0 : event.y + 1;
++		return this.mouse(event, event.x, y);
++	}
++}
+diff --git i/packages/coding-agent/src/modes/interactive/chat-viewport.ts w/packages/coding-agent/src/modes/interactive/chat-viewport.ts
+index eff762a..dc93ed1 100644
+--- i/packages/coding-agent/src/modes/interactive/chat-viewport.ts
++++ w/packages/coding-agent/src/modes/interactive/chat-viewport.ts
+@@ -31,7 +31,7 @@ export function createChatViewport(options: ChatViewportOptions): ChatViewport {
+ 	const dock = new VStack([
+ 		{ component: options.pendingMessages, shrink: 1, minSize: 0 },
+ 		{ component: options.status, shrink: 1, minSize: 0 },
+-		...(options.widgetsAbove === undefined ? [] : [{ component: options.widgetsAbove, shrink: 1, minSize: 0 }]),
++		...(options.widgetsAbove === undefined ? [] : [{ component: options.widgetsAbove, shrink: 1, minSize: 1 }]),
+ 		{ component: options.editor, shrink: 1, minSize: 3 },
+ 		...(options.widgetsBelow === undefined ? [] : [{ component: options.widgetsBelow, shrink: 1, minSize: 0 }]),
+ 		{ component: options.footer, shrink: 1, minSize: 0 },
+diff --git i/packages/coding-agent/src/modes/interactive/interactive-mode.ts w/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 3196de6..7b04bf6 100644
+--- i/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ w/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -50,6 +50,7 @@ import {
+ 	TuiMainScreen,
+ 	type TuiMouseEvent,
+ 	type TuiMouseEventResult,
++	VStack,
+ 	visibleWidth,
+ } from "@earendil-works/pi-tui";
+ import chalk from "chalk";
+@@ -133,6 +134,7 @@ import { killTrackedDetachedChildren } from "../../utils/shell.ts";
+ import { loadAllHighlightLanguages } from "../../utils/syntax-highlight.ts";
+ import { ensureTool, type ToolStatus } from "../../utils/tools-manager.ts";
+ import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
++import { AgentStatusDock } from "./agent-status-dock.ts";
+ import { reportBug } from "./bug-report.ts";
+ import { ChatTranscript } from "./chat-transcript.ts";
+ import { createChatViewport } from "./chat-viewport.ts";
+@@ -568,9 +570,10 @@ export class InteractiveMode {
+ 	}>();
+ 
+ 	// Extension widgets (components rendered above/below the editor)
++	private agentStatusDock: AgentStatusDock | undefined;
+ 	private extensionWidgetsAbove = new Map<string, Component & { dispose?(): void }>();
+ 	private extensionWidgetsBelow = new Map<string, Component & { dispose?(): void }>();
+-	private widgetContainerAbove!: Container;
++	private widgetContainerAbove!: VStack;
+ 	private widgetContainerBelow!: Container;
+ 
+ 	// Custom footer from extension (undefined = use built-in footer)
+@@ -641,7 +644,7 @@ export class InteractiveMode {
+ 		this.documentContainer.addChild(this.chatContainer);
+ 		this.pendingMessagesContainer = new Container();
+ 		this.statusContainer = new Container();
+-		this.widgetContainerAbove = new Container();
++		this.widgetContainerAbove = new VStack();
+ 		this.widgetContainerBelow = new Container();
+ 		this.keybindings = KeybindingsManager.create();
+ 		setKeybindings(this.keybindings);
+@@ -892,7 +895,11 @@ export class InteractiveMode {
+ 	private switchTuiMode(mode: TuiMode, restoreProgress = true, startRenderer = true): boolean {
+ 		const previousUi = this.renderer;
+ 		if (mode === previousUi.mode) return true;
+-		if (previousUi.hasOverlayEntries) return false;
++		this.agentStatusDock?.hideOverlay();
++		if (previousUi.hasOverlayEntries) {
++			if (previousUi.mode === "fullscreen") this.agentStatusDock?.showOverlay();
++			return false;
++		}
+ 
+ 		const components = [...previousUi.children];
+ 		const focus = previousUi.getFocusedComponent();
+@@ -926,6 +933,7 @@ export class InteractiveMode {
+ 		this.renderer = nextUi;
+ 		this.options.tuiMode = mode;
+ 		this.mountInteractiveTui(nextUi, components);
++		if (mode === "fullscreen") this.agentStatusDock?.showOverlay();
+ 		nextUi.invalidate();
+ 		nextUi.setFocus(focus);
+ 		if (!startRenderer) return true;
+@@ -2309,6 +2317,10 @@ export class InteractiveMode {
+ 
+ 	private setEditorWorkingStatusIndicator(indicator: StatusIndicator | undefined): boolean {
+ 		this.defaultEditor.setWorkingStatusIndicator(undefined);
++		if (this.agentStatusDock) {
++			if (isEmbeddedStatus(this.editor)) this.editor.setWorkingStatusIndicator(undefined);
++			return true;
++		}
+ 		if (!isEmbeddedStatus(this.editor)) return false;
+ 		this.editor.setWorkingStatusIndicator(indicator);
+ 		return true;
+@@ -2342,6 +2354,7 @@ export class InteractiveMode {
+ 			clearedIndicator &&
+ 			!clearedIndicatorWasEmbedded &&
+ 			this.options.tuiMode === "regular" &&
++			!this.agentStatusDock &&
+ 			this.ui.getClearOnShrink()
+ 		) {
+ 			this.statusContainer.addChild(this.idleStatus);
+@@ -2414,6 +2427,7 @@ export class InteractiveMode {
+ 			map.delete(key);
+ 		};
+ 
++		if (key === "hempi.agent-panel") this.agentStatusDock?.hideOverlay();
+ 		removeExisting(this.extensionWidgetsAbove);
+ 		removeExisting(this.extensionWidgetsBelow);
+ 
+@@ -2445,6 +2459,7 @@ export class InteractiveMode {
+ 	}
+ 
+ 	private clearExtensionWidgets(): void {
++		this.agentStatusDock?.hideOverlay();
+ 		for (const widget of this.extensionWidgetsAbove.values()) {
+ 			widget.dispose?.();
+ 		}
+@@ -2497,7 +2512,29 @@ export class InteractiveMode {
+ 	 */
+ 	private renderWidgets(): void {
+ 		if (!this.widgetContainerAbove || !this.widgetContainerBelow) return;
+-		this.renderWidgetContainer(this.widgetContainerAbove, this.extensionWidgetsAbove, true, true);
++		const hadDock = this.agentStatusDock !== undefined;
++		this.agentStatusDock?.hideOverlay();
++		this.agentStatusDock = undefined;
++		const panel = this.extensionWidgetsAbove.get("hempi.agent-panel");
++		const above = new Map(this.extensionWidgetsAbove);
++		if (panel) {
++			above.delete("hempi.agent-panel");
++			this.agentStatusDock = new AgentStatusDock(panel, this.ui, (width) =>
++				width > 0 ? (this.activeStatusIndicator?.renderInBorder(width) ?? "") : "",
++			);
++		}
++		this.renderWidgetContainer(this.widgetContainerAbove, above, !panel, !panel);
++		if (this.agentStatusDock) {
++			this.widgetContainerAbove.addChild(this.agentStatusDock, { shrink: 0, minSize: 1 });
++			if (this.ui.mode === "fullscreen") this.agentStatusDock.showOverlay();
++		}
++		if (panel || hadDock) {
++			this.statusContainer.clear();
++			this.activeWorkingIndicatorEmbedded = this.setEditorWorkingStatusIndicator(this.activeStatusIndicator);
++			if (this.activeStatusIndicator && !this.activeWorkingIndicatorEmbedded) {
++				this.statusContainer.addChild(this.activeStatusIndicator);
++			}
++		}
+ 		this.renderWidgetContainer(this.widgetContainerBelow, this.extensionWidgetsBelow, false, false);
+ 		this.ui.requestRender();
+ 	}
+diff --git i/packages/coding-agent/test/agent-status-dock.test.ts w/packages/coding-agent/test/agent-status-dock.test.ts
+new file mode 100644
+index 0000000..6dfa7b6
+--- /dev/null
++++ w/packages/coding-agent/test/agent-status-dock.test.ts
+@@ -0,0 +1,258 @@
++import { Container, Text, type TUI, TuiAltScreen, type TuiMouseEvent, VStack } from "@earendil-works/pi-tui";
++import { describe, expect, test, vi } from "vitest";
++import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
++import { AgentStatusDock } from "../src/modes/interactive/agent-status-dock.ts";
++import { createChatViewport } from "../src/modes/interactive/chat-viewport.ts";
++import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
++
++function fixture() {
++	const terminal = new VirtualTerminal(40, 18);
++	const tui = new TuiAltScreen(terminal);
++	let expanded = false;
++	const events: TuiMouseEvent[] = [];
++	const panel = {
++		render: (width: number) => [
++			`${" ".repeat(Math.max(0, width - 6))}Agents`,
++			...(expanded
++				? [`${" ".repeat(Math.max(0, width - 10))}body one`, `${" ".repeat(Math.max(0, width - 10))}body two`]
++				: []),
++		],
++		invalidate: vi.fn(),
++		dispose: vi.fn(),
++		handleMouse: (event: TuiMouseEvent) => {
++			events.push(event);
++			if (event.y === 0 && event.type === "press") expanded = !expanded;
++			return { handled: true, capture: event.type === "press", focus: false };
++		},
++	};
++	const editor = new Text("top border\ninput\nbottom border", 0, 0);
++	const below = new Text("below", 0, 0);
++	const footer = new Text("footer\nfooter two", 0, 0);
++	const dock = new AgentStatusDock(panel, tui, () => "Thinking");
++	const viewport = createChatViewport({
++		document: new Text(Array.from({ length: 30 }, (_, i) => `transcript ${i}`).join("\n"), 0, 0),
++		pendingMessages: new Container(),
++		status: new Container(),
++		widgetsAbove: dock,
++		editor,
++		widgetsBelow: below,
++		footer,
++		scrollbar: "hidden",
++	});
++	tui.setLayoutRoot(viewport.root);
++	tui.setFocus(editor);
++	return {
++		terminal,
++		tui,
++		panel,
++		editor,
++		below,
++		footer,
++		dock,
++		events,
++		transcript: viewport.transcript,
++		expand: () => {
++			expanded = true;
++		},
++	};
++}
++
++describe("private agent status dock", () => {
++	test("shares one row without a spacer; expansion overlays upward without reflow or focus changes", async () => {
++		const f = fixture();
++		f.dock.showOverlay();
++		f.tui.start();
++		try {
++			await f.terminal.waitForRender();
++			const before = f.terminal.getViewport();
++			expect(before[11]).toBe(`Thinking${" ".repeat(26)}Agents`);
++			expect(before[12].trimEnd()).toBe("top border");
++			f.expand();
++			f.tui.requestRender();
++			await f.terminal.waitForRender();
++			const after = f.terminal.getViewport();
++			expect(after.slice(11)).toEqual(before.slice(11));
++			expect(after[9].trimEnd()).toContain("body one");
++			expect(after[10].trimEnd()).toContain("body two");
++			expect(after[9].slice(0, 10)).toBe(before[9].slice(0, 10));
++			expect(f.tui.getFocusedComponent()).toBe(f.editor);
++			f.dock.hideOverlay();
++			f.tui.requestRender();
++			await f.terminal.waitForRender();
++			expect(f.terminal.getViewport()).toEqual(before);
++		} finally {
++			f.dock.hideOverlay();
++			f.tui.stop();
++		}
++	});
++
++	test("reanchors using multiline editor, below-widget, footer and terminal heights each frame", async () => {
++		const f = fixture();
++		f.expand();
++		f.dock.showOverlay();
++		f.tui.start();
++		try {
++			await f.terminal.waitForRender();
++			f.editor.setText("top border\none\ntwo\nthree\nbottom border");
++			f.below.setText("below\nbelow two");
++			f.footer.setText("footer");
++			f.terminal.resize(50, 22);
++			f.tui.requestRender();
++			await f.terminal.waitForRender();
++			const lines = f.terminal.getViewport();
++			const row = lines.findIndex((line) => line.includes("Agents"));
++			expect(row).toBe(22 - 5 - 2 - 1 - 1);
++			expect(lines[row - 1]).toContain("body two");
++			expect(lines[row + 1].trimEnd()).toBe("top border");
++			expect(lines[row]).toHaveLength(50);
++		} finally {
++			f.dock.hideOverlay();
++			f.tui.stop();
++		}
++	});
++
++	test("routes body wheel and dock header mouse coordinates without stealing editor focus", async () => {
++		const f = fixture();
++		f.expand();
++		f.dock.showOverlay();
++		f.tui.start();
++		try {
++			await f.terminal.waitForRender();
++			f.terminal.sendInput("\x1b[<65;35;11M");
++			await f.terminal.waitForRender();
++			const wheel = f.events.find((event) => event.type === "wheel");
++			expect(wheel).toMatchObject({ x: 34, y: 2, width: 40, height: 3, wheelDelta: 1 });
++			f.terminal.sendInput("\x1b[<0;36;12M");
++			f.terminal.sendInput("\x1b[<0;36;12m");
++			await f.terminal.waitForRender();
++			expect(f.events.some((event) => event.type === "press" && event.y === 0)).toBe(true);
++			expect(f.events.some((event) => event.type === "release" && event.y === 0)).toBe(true);
++			expect(f.tui.getFocusedComponent()).toBe(f.editor);
++		} finally {
++			f.dock.hideOverlay();
++			f.tui.stop();
++		}
++	});
++
++	test("clips upward on short terminals and keeps logical body mouse rows", async () => {
++		const f = fixture();
++		f.expand();
++		f.terminal.resize(40, 8);
++		f.dock.showOverlay();
++		f.tui.start();
++		try {
++			await f.terminal.waitForRender();
++			const lines = f.terminal.getViewport();
++			expect(lines[0]).toContain("body two");
++			expect(lines[1]).toContain("Agents");
++			expect(lines[2].trimEnd()).toBe("top border");
++			f.terminal.sendInput("\x1b[<65;35;1M");
++			await f.terminal.waitForRender();
++			expect(f.events.find((event) => event.type === "wheel")?.y).toBe(2);
++			f.terminal.resize(40, 7);
++			f.tui.requestRender();
++			await f.terminal.waitForRender();
++			const shrunk = f.terminal.getViewport();
++			const header = shrunk.findIndex((line) => line.includes("Agents"));
++			expect(header).toBeGreaterThanOrEqual(0);
++			if (header > 0) expect(shrunk[header - 1]).toContain("body two");
++		} finally {
++			f.dock.hideOverlay();
++			f.tui.stop();
++		}
++	});
++
++	test("passive details preserve scroll-aware transcript selection outside the panel", async () => {
++		const f = fixture();
++		f.expand();
++		f.dock.showOverlay();
++		f.tui.start();
++		try {
++			await f.terminal.waitForRender();
++			f.terminal.sendInput("\x1b[<0;2;9M");
++			await f.terminal.waitForRender();
++			expect(Reflect.get(f.tui, "selectionAnchor")?.scrollView).toBe(f.transcript);
++		} finally {
++			f.dock.hideOverlay();
++			f.tui.stop();
++		}
++	});
++
++	test("dock recreated during a modal stays behind it", async () => {
++		const f = fixture();
++		f.expand();
++		f.dock.showOverlay();
++		f.tui.start();
++		let modal: ReturnType<TUI["showOverlay"]> | undefined;
++		try {
++			await f.terminal.waitForRender();
++			modal = f.tui.showOverlay(new Text("MODAL", 0, 0), { row: 10, col: 30, width: 10 });
++			f.dock.showOverlay();
++			await f.terminal.waitForRender();
++			expect(f.terminal.getViewport()[10]).toContain("MODAL");
++		} finally {
++			modal?.hide();
++			f.dock.hideOverlay();
++			f.tui.stop();
++		}
++	});
++
++	test("the native panel overlay does not block switching to regular mode", () => {
++		const f = fixture();
++		f.dock.showOverlay();
++		const ctx = Object.assign(Object.create(InteractiveMode.prototype), {
++			renderer: f.tui,
++			agentStatusDock: f.dock,
++			options: {},
++		});
++		Object.defineProperty(ctx, "settingsManager", {
++			value: { getFullscreenCopyOnSelect: () => false, getFullscreenWheelScrollLines: () => 3 },
++		});
++		const switchMode = Reflect.get(InteractiveMode.prototype, "switchTuiMode");
++		expect(switchMode.call(ctx, "regular", false, false)).toBe(true);
++		expect(ctx.renderer.mode).toBe("regular");
++		expect(f.tui.hasOverlayEntries).toBe(false);
++		expect(ctx.renderer.hasOverlayEntries).toBe(false);
++	});
++
++	test("regular mode keeps body inline above the shared dock", () => {
++		const panel = { render: () => ["      Agents", "body"], invalidate() {} };
++		const ui = { mode: "regular", terminal: { columns: 12, rows: 10 } } as TUI;
++		const dock = new AgentStatusDock(panel, ui, () => "Work");
++		expect(dock.render(12)).toEqual(["body", "Work  Agents"]);
++	});
++
++	test("InteractiveMode privately intercepts only the reserved key and cleans up on replacement/removal", () => {
++		const f = fixture();
++		const ctx = Object.assign(Object.create(InteractiveMode.prototype), {
++			ui: f.tui,
++			extensionWidgetsAbove: new Map(),
++			extensionWidgetsBelow: new Map(),
++			widgetContainerAbove: new VStack(),
++			widgetContainerBelow: new Container(),
++			statusContainer: new Container(),
++			editorContainer: new Container(),
++			footerContainer: new Container(),
++			defaultEditor: { setWorkingStatusIndicator: vi.fn() },
++			editor: {},
++			activeStatusIndicator: { renderInBorder: () => "Working" },
++		});
++		const setWidget = Reflect.get(InteractiveMode.prototype, "setExtensionWidget");
++		setWidget.call(ctx, "hempi.agent-panel", () => f.panel, { placement: "aboveEditor" });
++		expect(ctx.widgetContainerAbove.children).toHaveLength(1);
++		expect(ctx.widgetContainerAbove.render(40)).toEqual([`Working${" ".repeat(27)}Agents`]);
++		expect(ctx.statusContainer.children).toHaveLength(0);
++		setWidget.call(ctx, "other", ["ordinary"], { placement: "aboveEditor" });
++		expect(ctx.widgetContainerAbove.children).toHaveLength(2);
++		setWidget.call(ctx, "hempi.agent-panel", undefined);
++		expect(f.panel.dispose).toHaveBeenCalledTimes(1);
++		expect(f.tui.hasOverlayEntries).toBe(false);
++		expect(ctx.statusContainer.children).toHaveLength(1);
++		expect(ctx.widgetContainerAbove.children).toHaveLength(2); // Ordinary widget retains its stock spacer.
++		setWidget.call(ctx, "hempi.agent-panel", () => f.panel, { placement: "aboveEditor" });
++		Reflect.get(InteractiveMode.prototype, "clearExtensionWidgets").call(ctx);
++		expect(f.panel.dispose).toHaveBeenCalledTimes(2);
++		expect(f.tui.hasOverlayEntries).toBe(false);
++		expect(ctx.extensionWidgetsAbove.size).toBe(0);
++	});
++});
+diff --git i/packages/tui/src/tui-alt-screen.ts w/packages/tui/src/tui-alt-screen.ts
+index e92f5c9..b128e26 100644
+--- i/packages/tui/src/tui-alt-screen.ts
++++ w/packages/tui/src/tui-alt-screen.ts
+@@ -13,6 +13,7 @@ import {
+ 	getScrollbarGeometry,
+ 	getScrollViewBox,
+ 	getScrollViewsAt,
++	type LayoutBox,
+ 	type LayoutFrame,
+ 	renderLayoutFrame,
+ 	type ScrollbarGeometry,
+@@ -37,6 +38,7 @@ import {
+ 	CURSOR_MARKER,
+ 	compositeTuiLine,
+ 	dispatchMouseEvent,
++	type OverlayBounds,
+ 	type OverlayHandle,
+ 	retargetMouseEvent,
+ 	TuiBase,
+@@ -208,6 +210,20 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 	private previousScreenHeight = 0;
+ 	private layoutRoot: Component | undefined;
+ 	private currentLayout: LayoutFrame | undefined;
++
++	getComponentBounds(component: Component): OverlayBounds | undefined {
++		const find = (box: LayoutBox): OverlayBounds | undefined => {
++			if (box.component === component && box.clip.width > 0 && box.clip.height > 0) {
++				return { row: box.clip.y, col: box.clip.x, width: box.clip.width, height: box.clip.height };
++			}
++			for (const child of box.children) {
++				const bounds = find(child);
++				if (bounds) return bounds;
++			}
++			return undefined;
++		};
++		return this.currentLayout ? find(this.currentLayout.root) : undefined;
++	}
+ 	private readonly implicitDocument: Component;
+ 	private readonly implicitScrollView: ScrollView;
+ 	private readonly flashes: AltScreenFlashContainer;
+@@ -1042,7 +1058,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 	}
+ 
+ 	private getScrollbarTargetAt(x: number, y: number, includeHiddenAuto = false): ScrollbarTarget | undefined {
+-		if (this.hasOverlay() || !this.currentLayout) return undefined;
++		if (this.hasSelectionOverlayAt(x, y) || !this.currentLayout) return undefined;
+ 		for (const scrollView of getScrollViewsAt(this.currentLayout, x, y)) {
+ 			const box = getScrollViewBox(this.currentLayout, scrollView);
+ 			const geometry = box ? getScrollbarGeometry(box, includeHiddenAuto) : undefined;
+@@ -1377,7 +1393,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 		this.stopSelectionAutoScroll();
+ 		this.selectionPressActive = true;
+ 		const scrollView =
+-			!this.hasOverlay() && this.currentLayout
++			!this.hasSelectionOverlayAt(event.x, event.y) && this.currentLayout
+ 				? getScrollViewsAt(this.currentLayout, event.x, event.y)[0]
+ 				: undefined;
+ 		const anchor = this.getSelectionPoint(event, scrollView);
+@@ -1689,6 +1705,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 		let screen = this.resolveFakeCursors(nextLayout.lines.map((line) => line.replace(OSC133_ZONE_PREFIX, "")));
+ 		screen = this.applySearchHighlights(screen, nextLayout);
+ 		screen = this.compositeScrollToEndIndicator(screen, nextLayout, width);
++		this.currentLayout = nextLayout;
+ 		screen = this.compositeOverlays(screen, width, height);
+ 		if (screen.length > height) screen = screen.slice(screen.length - height);
+ 		screen = this.applySelection(screen, nextLayout);
+diff --git i/packages/tui/src/tui.ts w/packages/tui/src/tui.ts
+index 56a983b..b12a5b0 100644
+--- i/packages/tui/src/tui.ts
++++ w/packages/tui/src/tui.ts
+@@ -252,6 +252,8 @@ function parseSizeValue(value: SizeValue | undefined, referenceSize: number): nu
+  * Values can be absolute numbers or percentage strings (e.g., "50%").
+  */
+ export interface OverlayOptions {
++	/** Keep passive dock details beneath dialogs, regardless of creation order. */
++	background?: boolean;
+ 	// === Sizing ===
+ 	/** Width in columns, or percentage of terminal width (e.g., "50%") */
+ 	width?: SizeValue;
+@@ -495,6 +497,8 @@ export interface TUI extends Component {
+ export const VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
+ 
+ export interface ViewportTUI extends TUI {
++	/** Last allocated, visible rectangle of a component in the fullscreen layout. */
++	getComponentBounds(component: Component): OverlayBounds | undefined;
+ 	readonly [VIEWPORT_TUI]: true;
+ 	setLayoutRoot(component: Component | undefined): void;
+ }
+@@ -851,6 +855,16 @@ export abstract class TuiBase extends Container implements TUI {
+ 		return this.overlayStack.some((o) => this.isOverlayVisible(o));
+ 	}
+ 
++	/** Passive overlays only interrupt transcript selection inside their own rectangle. */
++	protected hasSelectionOverlayAt(x: number, y: number): boolean {
++		return (
++			this.getTopmostVisibleOverlay() !== undefined ||
++			this.renderedOverlayLayouts.some(
++				({ row, col, width, height }) => x >= col && x < col + width && y >= row && y < row + height,
++			)
++		);
++	}
++
+ 	/** Check if the focused component is a visible overlay */
+ 	protected isOverlayFocused(): boolean {
+ 		return this.overlayStack.some(
+@@ -1361,7 +1375,9 @@ export abstract class TuiBase extends Container implements TUI {
+ 		let minLinesNeeded = result.length;
+ 
+ 		const visibleEntries = this.overlayStack.filter((e) => this.isOverlayVisible(e));
+-		visibleEntries.sort((a, b) => a.focusOrder - b.focusOrder);
++		visibleEntries.sort(
++			(a, b) => Number(!!b.options?.background) - Number(!!a.options?.background) || a.focusOrder - b.focusOrder,
++		);
+ 		for (const entry of visibleEntries) {
+ 			const { component, options } = entry;
+ 

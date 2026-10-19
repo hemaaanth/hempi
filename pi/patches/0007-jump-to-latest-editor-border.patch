@@ -1,0 +1,300 @@
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 7b04bf6..7b15d9b 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -628,6 +628,7 @@ export class InteractiveMode {
+ 			showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
+ 			logDirectory: getAgentDir(),
+ 			terminal: options.terminal,
++			scrollToEndIndicatorAnchor: () => this.editorContainer,
+ 			onRightClickPaste: this.onRightClickPaste,
+ 			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
+ 			fullscreenWheelScrollLines: this.settingsManager.getFullscreenWheelScrollLines(),
+@@ -921,6 +922,7 @@ export class InteractiveMode {
+ 			showHardwareCursor,
+ 			logDirectory: getAgentDir(),
+ 			terminal,
++			scrollToEndIndicatorAnchor: () => this.editorContainer,
+ 			onRightClickPaste: this.onRightClickPaste,
+ 			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
+ 			fullscreenWheelScrollLines: this.settingsManager.getFullscreenWheelScrollLines(),
+diff --git a/packages/coding-agent/src/modes/interactive/tui-renderer.ts b/packages/coding-agent/src/modes/interactive/tui-renderer.ts
+index 6487c1c..c8770cf 100644
+--- a/packages/coding-agent/src/modes/interactive/tui-renderer.ts
++++ b/packages/coding-agent/src/modes/interactive/tui-renderer.ts
+@@ -1,4 +1,4 @@
+-import type { Terminal, WheelScrollLines } from "@earendil-works/pi-tui";
++import type { Component, Terminal, WheelScrollLines } from "@earendil-works/pi-tui";
+ import { ProcessTerminal, type TUI, TuiAltScreen, TuiMainScreen } from "@earendil-works/pi-tui";
+ import { copyToClipboard } from "../../utils/clipboard.ts";
+ import { openBrowser } from "../../utils/open-browser.ts";
+@@ -13,6 +13,7 @@ export interface InteractiveTuiOptions {
+ 	readonly onRightClickPaste?: () => void;
+ 	readonly fullscreenCopyOnSelect?: boolean;
+ 	readonly fullscreenWheelScrollLines?: WheelScrollLines;
++	readonly scrollToEndIndicatorAnchor?: () => Component | undefined;
+ }
+ 
+ /** Composition root shared by coding-agent presentations. */
+@@ -32,6 +33,7 @@ export function createInteractiveTui(options: InteractiveTuiOptions): TuiMainScr
+ 				const label = ` ↓ Jump to latest message${shortcut ? ` · ${shortcut}` : ""} `;
+ 				return theme.bg("selectedBg", theme.fg("text", label));
+ 			},
++			scrollToEndIndicatorAnchor: options.scrollToEndIndicatorAnchor,
+ 			openUrl: openBrowser,
+ 			onRightClickPaste: options.onRightClickPaste,
+ 			copyOnSelect: options.fullscreenCopyOnSelect,
+diff --git a/packages/tui/src/tui-alt-screen.ts b/packages/tui/src/tui-alt-screen.ts
+index b128e26..5772f75 100644
+--- a/packages/tui/src/tui-alt-screen.ts
++++ b/packages/tui/src/tui-alt-screen.ts
+@@ -186,6 +186,8 @@ export interface TuiAltScreenOptions {
+ 	 * primary scroll view while that view is scrolled away from its end.
+ 	 */
+ 	scrollToEndIndicator?: () => string;
++	/** Center the label on this component's first visible row instead of the transcript's last row. */
++	scrollToEndIndicatorAnchor?: () => Component | undefined;
+ 	/** Open an OSC 8 hyperlink activated with a primary-button click. */
+ 	openUrl?: (url: string) => void;
+ 	/** Handle an unmodified secondary-button press for clipboard paste. Currently enabled on Windows only. */
+@@ -263,6 +265,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 	private readonly searchCurrentMatchStyle: (text: string) => string;
+ 	private readonly searchNavigationButtonStyle: (text: string, hovered: boolean) => string;
+ 	private readonly scrollToEndIndicator?: () => string;
++	private readonly scrollToEndIndicatorAnchor?: () => Component | undefined;
+ 	private readonly openUrl?: (url: string) => void;
+ 	private readonly onRightClickPaste?: () => void;
+ 	private copyOnSelect: boolean;
+@@ -290,6 +293,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 		this.searchCurrentMatchStyle = options.searchCurrentMatchStyle ?? ((text) => `\x1b[1;7m${text}\x1b[22;27m`);
+ 		this.searchNavigationButtonStyle = options.searchNavigationButtonStyle ?? ((text) => text);
+ 		this.scrollToEndIndicator = options.scrollToEndIndicator;
++		this.scrollToEndIndicatorAnchor = options.scrollToEndIndicatorAnchor;
+ 		this.openUrl = options.openUrl;
+ 		this.onRightClickPaste = options.onRightClickPaste;
+ 		this.copyOnSelect = options.copyOnSelect ?? true;
+@@ -1659,11 +1663,14 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 		const scrollView = layout.primaryScrollView ?? this.implicitScrollView;
+ 		if (!this.scrollToEndIndicator || !scrollView.followEnd || scrollView.isFollowingEnd) return screen;
+ 		const box = getScrollViewBox(layout, scrollView);
+-		const clip = box?.clip;
++		const anchor = this.scrollToEndIndicatorAnchor?.();
++		const bounds = anchor ? this.getComponentBounds(anchor) : undefined;
++		if (this.scrollToEndIndicatorAnchor && !bounds) return screen;
++		const clip = bounds ? { x: bounds.col, y: bounds.row, width: bounds.width, height: bounds.height } : box?.clip;
+ 		if (!clip || clip.width <= 0 || clip.height <= 0) return screen;
+-		const row = clip.y + clip.height - 1;
++		const row = bounds ? clip.y : clip.y + clip.height - 1;
+ 		if (row >= screen.length || isImageLine(screen[row] ?? "")) return screen;
+-		const scrollbarColumn = box ? getScrollbarGeometry(box)?.column : undefined;
++		const scrollbarColumn = !bounds && box ? getScrollbarGeometry(box)?.column : undefined;
+ 		const label = truncateToWidth(this.scrollToEndIndicator(), clip.width, "");
+ 		const labelWidth = visibleWidth(label);
+ 		const column = clip.x + Math.floor((clip.width - labelWidth) / 2);
+@@ -1672,6 +1679,13 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 		const text = truncateToWidth(label, availableWidth, "");
+ 		const textWidth = visibleWidth(text);
+ 		if (textWidth === 0) return screen;
++		// Clipped editors and embedded status labels must never be overwritten.
++		if (
++			bounds &&
++			stripTerminalSequences(sliceByColumn(screen[row] ?? "", column, textWidth, true)) !== "─".repeat(textWidth)
++		) {
++			return screen;
++		}
+ 		const result = [...screen];
+ 		result[row] = compositeTuiLine(result[row] ?? "", text, column, textWidth, width);
+ 		this.scrollToEndIndicatorRect = { row, column, width: textWidth };
+@@ -1704,8 +1718,8 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
+ 		// Resolve fake cursors before highlighting and compositing, which only track SGR codes
+ 		let screen = this.resolveFakeCursors(nextLayout.lines.map((line) => line.replace(OSC133_ZONE_PREFIX, "")));
+ 		screen = this.applySearchHighlights(screen, nextLayout);
+-		screen = this.compositeScrollToEndIndicator(screen, nextLayout, width);
+ 		this.currentLayout = nextLayout;
++		screen = this.compositeScrollToEndIndicator(screen, nextLayout, width);
+ 		screen = this.compositeOverlays(screen, width, height);
+ 		if (screen.length > height) screen = screen.slice(screen.length - height);
+ 		screen = this.applySelection(screen, nextLayout);
+diff --git a/packages/coding-agent/test/jump-to-latest-dock.test.ts b/packages/coding-agent/test/jump-to-latest-dock.test.ts
+new file mode 100644
+index 0000000..636f45f
+--- /dev/null
++++ b/packages/coding-agent/test/jump-to-latest-dock.test.ts
+@@ -0,0 +1,177 @@
++import { Container, getKeybindings, setKeybindings, Text } from "@earendil-works/pi-tui";
++import { expect, test } from "vitest";
++import { defaultEditorTheme } from "../../tui/test/test-themes.ts";
++import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
++import { KeybindingsManager } from "../src/core/keybindings.ts";
++import { AgentStatusDock } from "../src/modes/interactive/agent-status-dock.ts";
++import { createChatViewport } from "../src/modes/interactive/chat-viewport.ts";
++import { CustomEditor } from "../src/modes/interactive/components/custom-editor.ts";
++import { WorkingStatusIndicator } from "../src/modes/interactive/components/status-indicator.ts";
++import { initTheme } from "../src/modes/interactive/theme/theme.ts";
++import { createInteractiveTui } from "../src/modes/interactive/tui-renderer.ts";
++
++for (const agentDock of [false, true]) {
++	test(`jump hint stays on the editor border below Working (agent dock: ${agentDock})`, async () => {
++		initTheme("dark");
++		const previousKeys = getKeybindings();
++		setKeybindings(new KeybindingsManager({ "tui.altScreen.bottom": "ctrl+j" }));
++		const terminal = new VirtualTerminal(60, 18);
++		const editor = new Text(`${"─".repeat(60)}\ninput\n${"─".repeat(60)}`, 0, 0);
++		const editorContainer = new Container();
++		editorContainer.addChild(editor);
++		const ui = createInteractiveTui({
++			tuiMode: "fullscreen",
++			showHardwareCursor: false,
++			logDirectory: "/tmp",
++			terminal,
++			scrollToEndIndicatorAnchor: () => editorContainer,
++		});
++		const dock = new AgentStatusDock({ render: () => ["Agents"], invalidate() {} }, ui, () => "Working");
++		const viewport = createChatViewport({
++			document: new Text(Array.from({ length: 50 }, (_, i) => `transcript ${i}`).join("\n"), 0, 0),
++			pendingMessages: new Text("pending", 0, 0),
++			status: agentDock ? new Container() : new Text("Working", 0, 0),
++			...(agentDock ? { widgetsAbove: dock } : {}),
++			editor: editorContainer,
++			widgetsBelow: new Text("below", 0, 0),
++			footer: new Text("footer", 0, 0),
++			scrollbar: "always",
++		});
++		ui.setLayoutRoot(viewport.root);
++		ui.setFocus(editor);
++		ui.start();
++		try {
++			await terminal.waitForRender();
++			expect(terminal.getViewport().some((line) => line.includes("Jump to latest"))).toBe(false);
++			terminal.sendInput("\x1b[<64;1;1M");
++			await terminal.waitForRender();
++			let lines = terminal.getViewport();
++			let border = ui.getComponentBounds(editorContainer)!.row;
++			expect(lines[border]).toContain("─ ↓ Jump to latest message · Ctrl+J ─");
++			expect(lines[border - 1]).toContain("Working");
++			expect(lines.filter((line) => line.includes("Jump to latest"))).toHaveLength(1);
++			// The old transcript-bottom hit region must no longer jump.
++			const transcriptBounds = ui.getComponentBounds(viewport.transcript)!;
++			const oldHintRow = transcriptBounds.row + transcriptBounds.height;
++			terminal.sendInput(`\x1b[<0;30;${oldHintRow}M`);
++			terminal.sendInput(`\x1b[<0;30;${oldHintRow}m`);
++			await terminal.waitForRender();
++			expect(viewport.transcript.isFollowingEnd).toBe(false);
++			ui.resetTextSelection();
++			ui.scrollToTop();
++
++			// Wrapped/multiline editor, changing terminal dimensions, and constrained dock allocation.
++			for (const [width, height] of [
++				[48, 22],
++				[24, 10],
++				[60, 18],
++			] as const) {
++				editor.setText(`${"─".repeat(width)}\none\ntwo\nthree\n${"─".repeat(width)}`);
++				terminal.resize(width, height);
++				ui.requestRender();
++				await terminal.waitForRender();
++				lines = terminal.getViewport();
++				border = ui.getComponentBounds(editorContainer)!.row;
++				expect(lines[border]).toContain("↓ Jump to latest");
++				expect(lines[border - 1]).toContain("Working");
++				expect(lines[border + 1].trimEnd()).toBe("one");
++				expect(lines.every((line) => line.length <= width)).toBe(true);
++			}
++			const column = lines[border].indexOf("↓") + 1;
++			terminal.sendInput(`\x1b[<0;${column};${border + 1}M`);
++			terminal.sendInput(`\x1b[<0;${column};${border + 1}m`);
++			await terminal.waitForRender();
++			expect(viewport.transcript.isFollowingEnd).toBe(true);
++			expect(terminal.getViewport()[border].trimEnd()).toBe("─".repeat(60));
++			expect(ui.getFocusedComponent()).toBe(editor);
++
++			terminal.sendInput("\x1b[<64;1;1M");
++			await terminal.waitForRender();
++			terminal.sendInput("\n"); // Configured Ctrl+J action.
++			await terminal.waitForRender();
++			expect(viewport.transcript.isFollowingEnd).toBe(true);
++			expect(terminal.getViewport().some((line) => line.includes("Jump to latest"))).toBe(false);
++		} finally {
++			ui.stop();
++			setKeybindings(previousKeys);
++		}
++	});
++}
++
++for (const clipped of [true, false]) {
++	test(`real focused editor preserves ${clipped ? "clipped input" : "embedded Working status"} instead of painting a hint`, async () => {
++		initTheme("dark");
++		const terminal = new VirtualTerminal(clipped ? 60 : 24, clipped ? 4 : 18);
++		const editorContainer = new Container();
++		const ui = createInteractiveTui({
++			tuiMode: "fullscreen",
++			showHardwareCursor: false,
++			logDirectory: "/tmp",
++			terminal,
++			scrollToEndIndicatorAnchor: () => editorContainer,
++		});
++		const editor = new CustomEditor(ui, defaultEditorTheme, new KeybindingsManager(), {
++			embedWorkingStatus: !clipped,
++		});
++		editor.setText(clipped ? "one\ntwo\nthree\nfour\nfive" : "input");
++		const working = new WorkingStatusIndicator(ui, "Working");
++		working.stop();
++		if (!clipped) editor.setWorkingStatusIndicator(working);
++		editorContainer.addChild(editor);
++		const viewport = createChatViewport({
++			document: new Text(Array.from({ length: 50 }, (_, i) => `transcript ${i}`).join("\n"), 0, 0),
++			pendingMessages: new Container(),
++			status: new Container(),
++			editor: editorContainer,
++			footer: new Container(),
++		});
++		ui.setLayoutRoot(viewport.root);
++		ui.setFocus(editor);
++		ui.start();
++		try {
++			await terminal.waitForRender();
++			const row = ui.getComponentBounds(editorContainer)!.row;
++			const before = terminal.getViewport().slice(row);
++			expect(before[0]).toContain(clipped ? "three" : "Working");
++			terminal.sendInput("\x1b[<64;1;1M");
++			await terminal.waitForRender();
++			expect(viewport.transcript.isFollowingEnd).toBe(false);
++			expect(terminal.getViewport().slice(row)).toEqual(before);
++			expect(terminal.getViewport().some((line) => line.includes("↓ Jump"))).toBe(false);
++			expect(ui.getFocusedComponent()).toBe(editor);
++			terminal.resize(120, 24);
++			ui.scrollToTop();
++			ui.requestRender();
++			await terminal.waitForRender();
++			const border = terminal.getViewport()[ui.getComponentBounds(editorContainer)!.row];
++			expect(border).toContain("↓ Jump to latest");
++			if (!clipped) expect(border).toContain("Working");
++		} finally {
++			working.dispose();
++			ui.stop();
++		}
++	});
++}
++
++test("an unavailable editor anchor hides the hint rather than painting on the transcript", async () => {
++	initTheme("dark");
++	const terminal = new VirtualTerminal(60, 4);
++	const ui = createInteractiveTui({
++		tuiMode: "fullscreen",
++		showHardwareCursor: false,
++		logDirectory: "/tmp",
++		terminal,
++		scrollToEndIndicatorAnchor: () => new Container(),
++	});
++	ui.addChild(new Text(Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n"), 0, 0));
++	ui.start();
++	try {
++		await terminal.waitForRender();
++		terminal.sendInput("\x1b[<64;1;1M");
++		await terminal.waitForRender();
++		expect(ui.isFollowingOutput).toBe(false);
++		expect(terminal.getViewport().some((line) => line.includes("Jump to latest"))).toBe(false);
++	} finally {
++		ui.stop();
++	}
++});

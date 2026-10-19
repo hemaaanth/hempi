@@ -1,0 +1,22 @@
+name: Public alpha checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  offline-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.10.0'
+          cache: npm
+      - name: Install offline tool prerequisites
+        run: sudo apt-get update && sudo apt-get install -y ripgrep fd-find
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      # Clears ambient credentials and uses disposable HOME/Pi/OptChat directories.
+      # Tests use local fake providers; npm installation itself requires the registry.
+      - run: npm run test:ci

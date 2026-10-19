@@ -1,0 +1,13 @@
+# Managed by Hempi Pi channel; edit the template in the Hempi repository.
+[Unit]
+Description=Build and validate the downstream Hempi Pi channel
+
+[Service]
+Type=oneshot
+WorkingDirectory=@ROOT@
+ExecStart=:@NODE@ @SCRIPT@ update
+Environment=@PATH@
+Environment=HEMPI_PI_SCHEDULED=1
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,497 @@
+diff --git a/packages/coding-agent/schemas/keybindings.schema.json b/packages/coding-agent/schemas/keybindings.schema.json
+index aa3b3e9..51f1d69 100644
+--- a/packages/coding-agent/schemas/keybindings.schema.json
++++ b/packages/coding-agent/schemas/keybindings.schema.json
+@@ -235,6 +235,10 @@
+       "$ref": "#/$defs/KeybindingValue",
+       "description": "Toggle tool output"
+     },
++    "app.transcript.toggle": {
++      "$ref": "#/$defs/KeybindingValue",
++      "description": "Toggle chat-only transcript"
++    },
+     "app.thinking.toggle": {
+       "$ref": "#/$defs/KeybindingValue",
+       "description": "Toggle thinking blocks"
+diff --git a/packages/coding-agent/schemas/settings.schema.json b/packages/coding-agent/schemas/settings.schema.json
+index 4d6c23a..d125fb0 100644
+--- a/packages/coding-agent/schemas/settings.schema.json
++++ b/packages/coding-agent/schemas/settings.schema.json
+@@ -203,6 +203,11 @@
+       "type": "boolean",
+       "default": false
+     },
++    "chatOnlyTranscript": {
++      "type": "boolean",
++      "description": "Show only user messages and final replies instead of full transcript activity.",
++      "default": true
++    },
+     "showCacheMissNotices": {
+       "type": "boolean",
+       "description": "Show cache cost and provider recovery notices.",
+diff --git a/packages/coding-agent/src/core/settings-defaults.ts b/packages/coding-agent/src/core/settings-defaults.ts
+index 1f90280..c12e8bb 100644
+--- a/packages/coding-agent/src/core/settings-defaults.ts
++++ b/packages/coding-agent/src/core/settings-defaults.ts
+@@ -25,6 +25,7 @@ export const SETTINGS_DEFAULTS = {
+ 		},
+ 	},
+ 	hideThinkingBlock: false,
++	chatOnlyTranscript: true,
+ 	showCacheMissNotices: false,
+ 	quietStartup: false,
+ 	defaultProjectTrust: "ask",
+diff --git a/packages/coding-agent/src/core/settings-manager.ts b/packages/coding-agent/src/core/settings-manager.ts
+index ad8b82c..d4c0601 100644
+--- a/packages/coding-agent/src/core/settings-manager.ts
++++ b/packages/coding-agent/src/core/settings-manager.ts
+@@ -950,6 +950,23 @@ export class SettingsManager {
+ 		return parseTimeoutSetting(this.settings.websocketConnectTimeoutMs, "websocketConnectTimeoutMs");
+ 	}
+ 
++	getChatOnlyTranscript(): boolean {
++		const value = this.settings.chatOnlyTranscript;
++		if (value !== undefined && typeof value !== "boolean") {
++			throw new Error(`Invalid chatOnlyTranscript setting: ${String(value)}. Expected a boolean.`);
++		}
++		return value ?? SETTINGS_DEFAULTS.chatOnlyTranscript;
++	}
++
++	setChatOnlyTranscript(enabled: boolean): void {
++		if (typeof enabled !== "boolean") {
++			throw new Error(`Invalid chatOnlyTranscript setting: ${String(enabled)}. Expected a boolean.`);
++		}
++		this.globalSettings.chatOnlyTranscript = enabled;
++		this.markModified("chatOnlyTranscript");
++		this.save();
++	}
++
+ 	getHideThinkingBlock(): boolean {
+ 		return this.settings.hideThinkingBlock ?? SETTINGS_DEFAULTS.hideThinkingBlock;
+ 	}
+diff --git a/packages/coding-agent/src/core/settings-schema.ts b/packages/coding-agent/src/core/settings-schema.ts
+index b17bab5..c054773 100644
+--- a/packages/coding-agent/src/core/settings-schema.ts
++++ b/packages/coding-agent/src/core/settings-schema.ts
+@@ -243,6 +243,12 @@ export const SettingsSchema = Type.Object(
+ 		branchSummary: Type.Optional(BranchSummarySettingsSchema),
+ 		retry: Type.Optional(RetrySettingsSchema),
+ 		hideThinkingBlock: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.hideThinkingBlock })),
++		chatOnlyTranscript: Type.Optional(
++			Type.Boolean({
++				description: "Show only user messages and final replies instead of full transcript activity.",
++				default: SETTINGS_DEFAULTS.chatOnlyTranscript,
++			}),
++		),
+ 		showCacheMissNotices: Type.Optional(
+ 			Type.Boolean({
+ 				description: "Show cache cost and provider recovery notices.",
+diff --git a/packages/coding-agent/src/modes/interactive/components/settings-selector.ts b/packages/coding-agent/src/modes/interactive/components/settings-selector.ts
+index e0cca78..8cddda9 100644
+--- a/packages/coding-agent/src/modes/interactive/components/settings-selector.ts
++++ b/packages/coding-agent/src/modes/interactive/components/settings-selector.ts
+@@ -81,6 +81,7 @@ export interface SettingsConfig {
+ 	terminalTheme: TerminalTheme;
+ 	availableThemes: string[];
+ 	hideThinkingBlock: boolean;
++	chatOnlyTranscript: boolean;
+ 	mermaidRenderingMode: MermaidRenderingMode;
+ 	showCacheMissNotices: boolean;
+ 	collapseChangelog: boolean;
+@@ -121,6 +122,7 @@ export interface SettingsCallbacks {
+ 	onThemeChange: (theme: string) => void;
+ 	onThemePreview?: (theme: string) => void;
+ 	onHideThinkingBlockChange: (hidden: boolean) => void;
++	onChatOnlyTranscriptChange: (enabled: boolean) => void;
+ 	onMermaidRenderingModeChange: (mode: MermaidRenderingMode) => void;
+ 	onShowCacheMissNoticesChange: (shown: boolean) => void;
+ 	onCollapseChangelogChange: (collapsed: boolean) => void;
+@@ -536,6 +538,13 @@ export class SettingsSelectorComponent extends Container {
+ 				currentValue: config.cacheWarmingMode,
+ 				values: [...CACHE_WARMING_MODES],
+ 			},
++			{
++				id: "chat-only-transcript",
++				label: "Chat-only transcript",
++				description: "Show only user messages and final replies (true), or full activity (false)",
++				currentValue: config.chatOnlyTranscript ? "true" : "false",
++				values: ["true", "false"],
++			},
+ 			{
+ 				id: "hide-thinking",
+ 				label: "Hide thinking",
+@@ -924,6 +933,9 @@ export class SettingsSelectorComponent extends Container {
+ 					case "cache-warming-mode":
+ 						callbacks.onCacheWarmingModeChange(newValue as CacheWarmingMode);
+ 						break;
++					case "chat-only-transcript":
++						callbacks.onChatOnlyTranscriptChange(newValue === "true");
++						break;
+ 					case "hide-thinking":
+ 						callbacks.onHideThinkingBlockChange(newValue === "true");
+ 						break;
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 097bb31..e6af661 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -634,6 +634,7 @@ export class InteractiveMode {
+ 		this.headerContainer = new Container();
+ 		this.loadedResourcesContainer = new Container();
+ 		this.chatContainer = new ChatTranscript();
++		this.chatContainer.chatOnly = this.settingsManager.getChatOnlyTranscript();
+ 		this.documentContainer = new Container();
+ 		this.documentContainer.addChild(this.headerContainer);
+ 		this.documentContainer.addChild(this.loadedResourcesContainer);
+@@ -2063,6 +2064,7 @@ export class InteractiveMode {
+ 	private applyRuntimeSettings(): void {
+ 		setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides());
+ 		this.ensurePngTranscoder();
++		this.setChatOnly(this.settingsManager.getChatOnlyTranscript());
+ 		configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
+ 		this.applyFullscreenScrollbarSetting();
+ 		if (this.renderer instanceof TuiAltScreen) {
+@@ -4621,6 +4623,13 @@ export class InteractiveMode {
+ 	}
+ 
+ 	private toggleChatOnly(): void {
++		const enabled = !this.chatContainer.chatOnly;
++		this.settingsManager.setChatOnlyTranscript(enabled);
++		this.setChatOnly(enabled);
++	}
++
++	private setChatOnly(enabled: boolean): void {
++		if (enabled === this.chatContainer.chatOnly) return;
+ 		const scroll = this.transcriptScrollView;
+ 		if (scroll) {
+ 			this.chatContainer.transcriptPositions.set(this.chatContainer.chatOnly, {
+@@ -4628,7 +4637,7 @@ export class InteractiveMode {
+ 				follow: scroll.isFollowingEnd,
+ 			});
+ 		}
+-		this.chatContainer.chatOnly = !this.chatContainer.chatOnly;
++		this.chatContainer.chatOnly = enabled;
+ 		if (this.chatContainer.chatOnly && this.session.isStreaming && !this.activeStatusIndicator) {
+ 			this.showWorkingStatusIndicator();
+ 		}
+@@ -5038,6 +5047,7 @@ export class InteractiveMode {
+ 					terminalTheme: this.themeController.getTerminalTheme(),
+ 					availableThemes: getAvailableThemes(),
+ 					hideThinkingBlock: this.hideThinkingBlock,
++					chatOnlyTranscript: this.chatContainer.chatOnly,
+ 					mermaidRenderingMode: this.settingsManager.getMermaidRenderingMode(),
+ 					collapseChangelog: this.settingsManager.getCollapseChangelog(),
+ 					enableInstallTelemetry: this.settingsManager.getEnableInstallTelemetry(),
+@@ -5138,6 +5148,10 @@ export class InteractiveMode {
+ 						this.themeController.setThemeSetting(themeSetting);
+ 					},
+ 					onThemePreview: (themeName) => this.themeController.preview(themeName),
++					onChatOnlyTranscriptChange: (enabled) => {
++						this.settingsManager.setChatOnlyTranscript(enabled);
++						this.setChatOnly(enabled);
++					},
+ 					onHideThinkingBlockChange: (hidden) => {
+ 						this.hideThinkingBlock = hidden;
+ 						this.settingsManager.setHideThinkingBlock(hidden);
+@@ -6579,6 +6593,7 @@ export class InteractiveMode {
+ 			if (chatRestoredBeforeSessionStart) {
+ 				return;
+ 			}
++			this.setChatOnly(this.settingsManager.getChatOnlyTranscript());
+ 			this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
+ 			this.outputPad = this.settingsManager.getOutputPad();
+ 			this.rebuildChatFromMessages();
+diff --git a/packages/coding-agent/test/chat-only-settings.test.ts b/packages/coding-agent/test/chat-only-settings.test.ts
+new file mode 100644
+index 0000000..da632a4
+--- /dev/null
++++ b/packages/coding-agent/test/chat-only-settings.test.ts
+@@ -0,0 +1,134 @@
++import { fauxAssistantMessage } from "@earendil-works/pi-ai";
++import { Text } from "@earendil-works/pi-tui";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
++import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
++import type { ChatTranscript } from "../src/modes/interactive/chat-transcript.ts";
++import type { SettingsSelectorComponent } from "../src/modes/interactive/components/settings-selector.ts";
++import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
++import { stopThemeWatcher } from "../src/modes/interactive/theme/theme.ts";
++import { createHarness, type Harness } from "./suite/harness.ts";
++
++const invoke = (target: object, method: string, ...args: unknown[]) =>
++	Reflect.apply(Reflect.get(target, method), target, args);
++
++describe("chat-only interactive settings", () => {
++	let harness: Harness | undefined;
++	let mode: InteractiveMode | undefined;
++
++	afterEach(() => {
++		if (mode) {
++			invoke(Reflect.get(mode, "footerDataProvider"), "dispose");
++			invoke(Reflect.get(mode, "ui"), "stop");
++		}
++		stopThemeWatcher();
++		harness?.cleanup();
++		vi.restoreAllMocks();
++	});
++
++	async function createMode(enabled: boolean) {
++		harness = await createHarness({ settings: { chatOnlyTranscript: enabled, theme: "dark" } });
++		const runtime = {
++			session: harness.session,
++			setBeforeSessionInvalidate: vi.fn(),
++			setRebindSession: vi.fn(),
++		} as unknown as AgentSessionRuntime;
++		mode = new InteractiveMode(runtime, { terminal: new VirtualTerminal(80, 24) });
++		return mode;
++	}
++
++	it("creates the native transcript with the saved false value", async () => {
++		const instance = await createMode(false);
++		expect(Reflect.get(instance, "chatContainer").chatOnly).toBe(false);
++		expect(harness!.getPendingResponseCount()).toBe(0);
++	});
++
++	it.each([true, false])("loads saved state before rebuilding chat during /reload (initial %s)", async (initial) => {
++		const instance = await createMode(initial);
++		const chat: ChatTranscript = Reflect.get(instance, "chatContainer");
++		harness!.settingsManager.setChatOnlyTranscript(!initial);
++		await harness!.settingsManager.flush();
++		const ui = Reflect.get(instance, "ui");
++		vi.spyOn(ui, "renderNow").mockImplementation(() => {});
++		vi.spyOn(ui, "requestRender").mockImplementation(() => {});
++		for (const method of [
++			"resetExtensionUI",
++			"setupAutocompleteProvider",
++			"setupExtensionShortcuts",
++			"showLoadedResources",
++			"showStatus",
++			"maybeSaveImplicitProjectTrustAfterReload",
++		])
++			Reflect.set(instance, method, vi.fn());
++		Reflect.set(instance, "themeController", { applyFromSettings: vi.fn() });
++		const rebuild = vi.fn(() => expect(chat.chatOnly).toBe(!initial));
++		Reflect.set(instance, "rebuildChatFromMessages", rebuild);
++		const showError = vi.fn();
++		Reflect.set(instance, "showError", showError);
++		await invoke(instance, "handleReloadCommand");
++		expect(showError).not.toHaveBeenCalled();
++		expect(rebuild).toHaveBeenCalledOnce();
++		expect(chat.chatOnly).toBe(!initial);
++	});
++
++	it("applies the settings menu immediately without replacing native history", async () => {
++		const instance = await createMode(true);
++		const chat: ChatTranscript = Reflect.get(instance, "chatContainer");
++		chat.addChild(new Text("native activity"));
++		const children = [...chat.children];
++		harness!.session.agent.state.messages = [
++			{ role: "user", content: "native prompt", timestamp: 0 },
++			fauxAssistantMessage("native reply"),
++		];
++		const messages = structuredClone(harness!.session.messages);
++		const scroll = {
++			scrollTop: 12,
++			isFollowingEnd: false,
++			scrollToEnd: vi.fn(),
++			scrollTo: vi.fn(),
++		};
++		Reflect.set(instance, "transcriptScrollView", scroll);
++		const ui = Reflect.get(instance, "ui");
++		vi.spyOn(ui, "renderNow").mockImplementation(() => {});
++		vi.spyOn(ui, "requestRender").mockImplementation(() => {});
++		let selector!: SettingsSelectorComponent;
++		Reflect.set(
++			instance,
++			"showSelector",
++			(factory: (done: () => void) => { component: SettingsSelectorComponent }) => {
++				selector = factory(() => {}).component;
++			},
++		);
++		const indicator = { kind: "working", setMessage: vi.fn() };
++		vi.spyOn(harness!.session, "isStreaming", "get").mockReturnValue(true);
++		Reflect.set(instance, "workingVisible", false);
++		Reflect.set(instance, "activeStatusIndicator", indicator);
++		Reflect.set(
++			instance,
++			"clearStatusIndicator",
++			vi.fn(() => Reflect.set(instance, "activeStatusIndicator", undefined)),
++		);
++		const showWorking = vi.fn(() => Reflect.set(instance, "activeStatusIndicator", indicator));
++		Reflect.set(instance, "showWorkingStatusIndicator", showWorking);
++		invoke(instance, "showSettingsSelector");
++		const list = selector.getSettingsList();
++		for (const character of "Chat-only transcript") list.handleInput(character);
++		list.handleInput("\r");
++		expect(chat.chatOnly).toBe(false);
++		expect(Reflect.get(instance, "activeStatusIndicator")).toBeUndefined();
++		expect(harness!.settingsManager.getChatOnlyTranscript()).toBe(false);
++		await harness!.settingsManager.reload();
++		expect(harness!.settingsManager.getChatOnlyTranscript()).toBe(false);
++		scroll.scrollTop = 27;
++		list.handleInput("\r");
++		expect(chat.chatOnly).toBe(true);
++		expect(showWorking).toHaveBeenCalledOnce();
++		expect(indicator.setMessage).toHaveBeenLastCalledWith("Working");
++		expect(harness!.settingsManager.getChatOnlyTranscript()).toBe(true);
++		expect(scroll.scrollTo).toHaveBeenLastCalledWith(12, { disableFollow: true });
++		expect(chat.children).toEqual(children);
++		expect(harness!.session.messages).toEqual(messages);
++		await harness!.settingsManager.reload();
++		expect(harness!.settingsManager.getChatOnlyTranscript()).toBe(true);
++	});
++});
+diff --git a/packages/coding-agent/test/chat-transcript.test.ts b/packages/coding-agent/test/chat-transcript.test.ts
+index 401d566..3cec155 100644
+--- a/packages/coding-agent/test/chat-transcript.test.ts
++++ b/packages/coding-agent/test/chat-transcript.test.ts
+@@ -147,7 +147,8 @@ test("native control keys restore the details viewport without changing Ctrl+T",
+ 		session: { isStreaming: false },
+ 		ui,
+ 		hideThinkingBlock: false,
+-		settingsManager: { setHideThinkingBlock: vi.fn() },
++		settingsManager: { setHideThinkingBlock: vi.fn(), setChatOnlyTranscript: vi.fn() },
++		setChatOnly: Reflect.get(InteractiveMode.prototype, "setChatOnly"),
+ 		updateThinkingBlockVisibility() {
+ 			Reflect.apply(Reflect.get(InteractiveMode.prototype, "updateThinkingBlockVisibility"), this, []);
+ 		},
+@@ -169,6 +170,7 @@ test("native control keys restore the details viewport without changing Ctrl+T",
+ 		editor.handleInput("\x1b[111;6u"); // Kitty Ctrl+Shift+O
+ 		await terminal.waitForRender();
+ 		expect(chat.chatOnly).toBe(false);
++		expect(context.settingsManager.setChatOnlyTranscript).toHaveBeenLastCalledWith(false);
+ 		viewport.transcript.scrollTo(12, { disableFollow: true });
+ 		ui.renderNow();
+ 		await terminal.waitForRender();
+@@ -301,6 +303,8 @@ test("active quiet spinner survives a hidden-working details roundtrip", () => {
+ 		chatContainer: chat,
+ 		session: { isStreaming: true },
+ 		workingVisible: false,
++		settingsManager: { setChatOnlyTranscript: vi.fn() },
++		setChatOnly: Reflect.get(InteractiveMode.prototype, "setChatOnly"),
+ 		defaultWorkingMessage: "Working",
+ 		activeStatusIndicator: indicator as typeof indicator | undefined,
+ 		clearStatusIndicator: vi.fn(() => {
+diff --git a/packages/coding-agent/test/config-schemas.test.ts b/packages/coding-agent/test/config-schemas.test.ts
+index 6d87d21..2618af3 100644
+--- a/packages/coding-agent/test/config-schemas.test.ts
++++ b/packages/coding-agent/test/config-schemas.test.ts
+@@ -194,6 +194,8 @@ describe("generated configuration schemas", () => {
+ 					modelOverrides: { "provider/model": { reserveTokens: Number.MAX_SAFE_INTEGER + 1 } },
+ 				},
+ 			},
++			{ chatOnlyTranscript: "false" },
++			{ chatOnlyTranscript: null },
+ 			{ httpIdleTimeoutMs: -1 },
+ 			{ websocketConnectTimeoutMs: -1 },
+ 			{ httpIdleTimeoutMs: "bogus" },
+@@ -212,6 +214,7 @@ describe("generated configuration schemas", () => {
+ 				httpIdleTimeoutMs: 0,
+ 				websocketConnectTimeoutMs: "disabled",
+ 				codemode: { inlineBudget: 0 },
++				chatOnlyTranscript: false,
+ 			}),
+ 		).toBe(true);
+ 	});
+diff --git a/packages/coding-agent/test/settings-manager.test.ts b/packages/coding-agent/test/settings-manager.test.ts
+index ac7e74a..0c248db 100644
+--- a/packages/coding-agent/test/settings-manager.test.ts
++++ b/packages/coding-agent/test/settings-manager.test.ts
+@@ -111,6 +111,29 @@ describe("SettingsManager", () => {
+ 		});
+ 	});
+ 
++	describe("chatOnlyTranscript", () => {
++		it("defaults to true and persists false only in the selected agent directory", async () => {
++			const manager = SettingsManager.create(projectDir, agentDir);
++			expect(manager.getChatOnlyTranscript()).toBe(true);
++			manager.setChatOnlyTranscript(false);
++			await manager.flush();
++			expect(SettingsManager.create(projectDir, agentDir).getChatOnlyTranscript()).toBe(false);
++			expect(SettingsManager.create(projectDir, join(testDir, "other-agent")).getChatOnlyTranscript()).toBe(true);
++			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ chatOnlyTranscript: true }));
++			await manager.reload();
++			expect(manager.getChatOnlyTranscript()).toBe(true);
++		});
++
++		it("rejects non-boolean stored values and setter inputs", () => {
++			for (const value of ["false", 0, null, [], {}]) {
++				writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ chatOnlyTranscript: value }));
++				const manager = SettingsManager.create(projectDir, agentDir);
++				expect(() => manager.getChatOnlyTranscript()).toThrow("Invalid chatOnlyTranscript setting");
++				expect(() => manager.setChatOnlyTranscript(value as boolean)).toThrow("Invalid chatOnlyTranscript setting");
++			}
++		});
++	});
++
+ 	describe("deviceId", () => {
+ 		it("creates one global device ID and reuses it in later processes", async () => {
+ 			const settingsPath = join(agentDir, "settings.json");
+diff --git a/packages/coding-agent/test/settings-selector.test.ts b/packages/coding-agent/test/settings-selector.test.ts
+index 35b9bfe..f96b22c 100644
+--- a/packages/coding-agent/test/settings-selector.test.ts
++++ b/packages/coding-agent/test/settings-selector.test.ts
+@@ -63,6 +63,28 @@ describe("SettingsSelectorComponent", () => {
+ 		expect(onWheelScrollLinesChange.mock.calls.flat()).toEqual([10, "auto", 1]);
+ 	});
+ 
++	it("finds and renders Chat-only transcript and calls back in both directions", () => {
++		const onChatOnlyTranscriptChange = vi.fn();
++		const config = {
++			chatOnlyTranscript: true,
++			availableDefaultModels: [],
++			modelThinkingLevels: {},
++			warnings: {},
++		} as unknown as SettingsConfig;
++		const callbacks = { onChatOnlyTranscriptChange } as unknown as SettingsCallbacks;
++		const list = new SettingsSelectorComponent(config, callbacks).getSettingsList();
++		for (const character of "Chat-only transcript") list.handleInput(character);
++		const output = () => stripAnsi(list.render(120).join("\n"));
++		expect(output()).toContain("Chat-only transcript");
++		expect(output()).toContain("user messages and final replies");
++		expect(output()).toContain("full activity");
++		expect(output()).toContain("true");
++		list.handleInput("\r");
++		expect(output()).toContain("false");
++		list.handleInput("\r");
++		expect(onChatOnlyTranscriptChange.mock.calls.flat()).toEqual([false, true]);
++	});
++
+ 	it("cycles through share destinations", () => {
+ 		const onSessionShareDestinationChange = vi.fn();
+ 		const config = {
+diff --git a/packages/coding-agent/test/suite/regressions/5943-session-start-notify.test.ts b/packages/coding-agent/test/suite/regressions/5943-session-start-notify.test.ts
+index dd56c19..a97ec01 100644
+--- a/packages/coding-agent/test/suite/regressions/5943-session-start-notify.test.ts
++++ b/packages/coding-agent/test/suite/regressions/5943-session-start-notify.test.ts
+@@ -63,6 +63,7 @@ type ReloadCommandContext = {
+ 	settingsManager: {
+ 		getHttpIdleTimeoutMs: () => number;
+ 		getHideThinkingBlock: () => boolean;
++		getChatOnlyTranscript: () => boolean;
+ 		getOutputPad: () => 0 | 1;
+ 		getEditorPaddingX: () => number;
+ 		getAutocompleteMaxVisible: () => number;
+@@ -83,6 +84,7 @@ type ReloadCommandContext = {
+ 	defaultEditor: { setPaddingX: (padding: number) => void; setAutocompleteMaxVisible: (maxVisible: number) => void };
+ 	themeController: { applyFromSettings: () => Promise<void> };
+ 	resetExtensionUI: () => void;
++	setChatOnly: (enabled: boolean) => void;
+ 	rebuildChatFromMessages: () => void;
+ 	setupAutocompleteProvider: () => void;
+ 	setupExtensionShortcuts: (runner: unknown) => void;
+@@ -135,6 +137,7 @@ function createReloadCommandContext(overrides: ReloadCommandContextOverrides = {
+ 		settingsManager: {
+ 			getHttpIdleTimeoutMs: () => 0,
+ 			getHideThinkingBlock: () => false,
++			getChatOnlyTranscript: () => true,
+ 			getOutputPad: () => 1,
+ 			getEditorPaddingX: () => 1,
+ 			getAutocompleteMaxVisible: () => 10,
+@@ -157,6 +160,7 @@ function createReloadCommandContext(overrides: ReloadCommandContextOverrides = {
+ 		customHeader: overrides.customHeader,
+ 		builtInHeader: overrides.builtInHeader,
+ 		resetExtensionUI: overrides.resetExtensionUI ?? (() => {}),
++		setChatOnly: overrides.setChatOnly ?? (() => {}),
+ 		rebuildChatFromMessages: overrides.rebuildChatFromMessages ?? (() => {}),
+ 		setupAutocompleteProvider: overrides.setupAutocompleteProvider ?? (() => {}),
+ 		setupExtensionShortcuts: overrides.setupExtensionShortcuts ?? (() => {}),

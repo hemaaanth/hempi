@@ -1,0 +1,12 @@
+# Managed by Hempi Pi channel; edit the template in the Hempi repository.
+[Unit]
+Description=Check daily for a compatible upstream Pi release
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+Unit=hempi-pi-update.service
+
+[Install]
+WantedBy=timers.target

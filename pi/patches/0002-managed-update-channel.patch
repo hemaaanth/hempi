@@ -1,0 +1,329 @@
+diff --git c/packages/coding-agent/src/core/managed-update-channel.ts w/packages/coding-agent/src/core/managed-update-channel.ts
+new file mode 100644
+index 0000000..4259a4f
+--- /dev/null
++++ w/packages/coding-agent/src/core/managed-update-channel.ts
+@@ -0,0 +1,55 @@
++import { type ChildProcess, type SpawnOptions, spawn } from "node:child_process";
++import { readFileSync, statSync } from "node:fs";
++import { isAbsolute, join } from "node:path";
++import { getPackageDir } from "../config.ts";
++import { waitForChildProcess } from "../utils/child-process.ts";
++
++interface ManagedUpdateHelpers {
++	getPackageDir(): string;
++	readFileSync(path: string, encoding: "utf8"): string;
++	statSync(path: string): { isDirectory(): boolean };
++	spawn(command: string, args: string[], options: SpawnOptions): ChildProcess;
++	waitForChildProcess(child: ChildProcess): Promise<number | null>;
++}
++
++// Only an absent marker permits the stock updater; broken channels must fail closed.
++export async function runManagedChannelUpdate(
++	force: boolean,
++	helpers: ManagedUpdateHelpers = { getPackageDir, readFileSync, statSync, spawn, waitForChildProcess },
++): Promise<boolean> {
++	const markerPath = join(helpers.getPackageDir(), "hempi-channel.json");
++	let content: string;
++	try {
++		content = helpers.readFileSync(markerPath, "utf8");
++	} catch (error: unknown) {
++		if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
++		throw error;
++	}
++
++	let marker: { format: number; root: string; node: string };
++	try {
++		marker = JSON.parse(content);
++		if (
++			marker?.format !== 1 ||
++			typeof marker.root !== "string" ||
++			!isAbsolute(marker.root) ||
++			typeof marker.node !== "string" ||
++			!isAbsolute(marker.node) ||
++			!helpers.statSync(marker.root).isDirectory()
++		) {
++			throw new Error("Invalid channel");
++		}
++	} catch {
++		throw new Error(`Invalid managed update channel: ${markerPath}`);
++	}
++
++	const code = await helpers.waitForChildProcess(
++		helpers.spawn(marker.node, [join(marker.root, "pi", "channel.mjs"), "update", ...(force ? ["--force"] : [])], {
++			cwd: marker.root,
++			shell: false,
++			stdio: "inherit",
++		}),
++	);
++	if (code !== 0) throw new Error(`Managed channel update exited with code ${code ?? "unknown"}`);
++	return true;
++}
+diff --git c/packages/coding-agent/src/package-manager-cli.ts w/packages/coding-agent/src/package-manager-cli.ts
+index 45a6db7..a5d55d4 100644
+--- c/packages/coding-agent/src/package-manager-cli.ts
++++ w/packages/coding-agent/src/package-manager-cli.ts
+@@ -28,6 +28,7 @@ import {
+ 	VERSION,
+ } from "./config.ts";
+ import type { InlineExtension } from "./core/extensions/types.ts";
++import { runManagedChannelUpdate } from "./core/managed-update-channel.ts";
+ import { ModelRuntime } from "./core/model-runtime.ts";
+ import { DefaultPackageManager } from "./core/package-manager.ts";
+ import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
+@@ -594,7 +595,7 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined
+ 	};
+ }
+ 
+-function updateTargetIncludesSelf(target: UpdateTarget): boolean {
++export function updateTargetIncludesSelf(target: UpdateTarget = { type: "self" }): boolean {
+ 	return target.type === "all" || target.type === "self";
+ }
+ 
+@@ -937,6 +938,19 @@ export async function handlePackageCommand(
+ 		return true;
+ 	}
+ 
++	if (options.command === "update" && updateTargetIncludesSelf(options.updateTarget)) {
++		try {
++			if (await runManagedChannelUpdate(options.force)) {
++				if (options.updateTarget?.type !== "all") return true;
++				options.updateTarget = { type: "extensions" };
++			}
++		} catch (error: unknown) {
++			console.error(chalk.red(`Error: ${error instanceof Error ? error.message : String(error)}`));
++			process.exitCode = 1;
++			return true;
++		}
++	}
++
+ 	if (options.command === "update" && options.updateTarget?.type === "models") {
+ 		try {
+ 			await refreshModelCatalogs(getAgentDir());
+diff --git c/packages/coding-agent/test/managed-update-channel.test.ts w/packages/coding-agent/test/managed-update-channel.test.ts
+new file mode 100644
+index 0000000..7a0f9a5
+--- /dev/null
++++ w/packages/coding-agent/test/managed-update-channel.test.ts
+@@ -0,0 +1,106 @@
++import { ChildProcess, spawn } from "node:child_process";
++import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { runManagedChannelUpdate } from "../src/core/managed-update-channel.ts";
++import { waitForChildProcess } from "../src/utils/child-process.ts";
++
++describe("managed update channel", () => {
++	let dir: string;
++	beforeEach(() => {
++		dir = mkdtempSync(join(tmpdir(), "pi-channel-"));
++	});
++	afterEach(() => rmSync(dir, { recursive: true, force: true }));
++
++	function helpers(code: number | null = 0) {
++		return {
++			getPackageDir: () => dir,
++			readFileSync,
++			statSync,
++			spawn: vi
++				.fn<NonNullable<Parameters<typeof runManagedChannelUpdate>[1]>["spawn"]>()
++				.mockReturnValue(new ChildProcess()),
++			waitForChildProcess: vi.fn(async () => code),
++		};
++	}
++
++	function marker(value: unknown = { format: 1, root: dir, node: process.execPath }) {
++		writeFileSync(join(dir, "hempi-channel.json"), JSON.stringify(value));
++	}
++
++	it("returns to stock only when the marker is absent", async () => {
++		const deps = helpers();
++		expect(await runManagedChannelUpdate(false, deps)).toBe(false);
++		expect(deps.spawn).not.toHaveBeenCalled();
++	});
++
++	it.each([false, true])("uses stable Node without a shell (force=%s)", async (force) => {
++		marker();
++		const deps = helpers();
++		expect(await runManagedChannelUpdate(force, deps)).toBe(true);
++		expect(deps.spawn).toHaveBeenCalledExactlyOnceWith(
++			process.execPath,
++			[join(dir, "pi", "channel.mjs"), "update", ...(force ? ["--force"] : [])],
++			{ cwd: dir, shell: false, stdio: "inherit" },
++		);
++	});
++
++	it.each([
++		null,
++		{},
++		{ format: 2 },
++		{ format: 1, root: "relative", node: process.execPath },
++		{ format: 1, node: "node" },
++	])("rejects invalid marker %j without spawning", async (value) => {
++		marker(value);
++		const deps = helpers();
++		await expect(runManagedChannelUpdate(false, deps)).rejects.toThrow("Invalid managed update channel");
++		expect(deps.spawn).not.toHaveBeenCalled();
++	});
++
++	it("rejects malformed JSON, missing roots, file roots, and relative Node", async () => {
++		const path = join(dir, "hempi-channel.json");
++		for (const content of [
++			"{",
++			JSON.stringify({ format: 1, root: join(dir, "missing"), node: process.execPath }),
++			JSON.stringify({ format: 1, root: path, node: process.execPath }),
++			JSON.stringify({ format: 1, root: dir, node: "node" }),
++		]) {
++			writeFileSync(path, content);
++			const deps = helpers();
++			await expect(runManagedChannelUpdate(false, deps)).rejects.toThrow("Invalid managed update channel");
++			expect(deps.spawn).not.toHaveBeenCalled();
++		}
++	});
++
++	it("does not treat unreadable markers as absent", async () => {
++		mkdirSync(join(dir, "hempi-channel.json"));
++		await expect(runManagedChannelUpdate(false, helpers())).rejects.toThrow();
++	});
++
++	it.each([23, null])("rejects child failure %s", async (code) => {
++		marker();
++		await expect(runManagedChannelUpdate(false, helpers(code))).rejects.toThrow(
++			`exited with code ${code ?? "unknown"}`,
++		);
++	});
++
++	it("propagates spawn errors", async () => {
++		marker();
++		const deps = helpers();
++		deps.waitForChildProcess.mockRejectedValue(new Error("spawn ENOENT"));
++		await expect(runManagedChannelUpdate(false, deps)).rejects.toThrow("spawn ENOENT");
++	});
++
++	it("runs a harmless local script using native defaults", async () => {
++		marker();
++		mkdirSync(join(dir, "pi"));
++		writeFileSync(
++			join(dir, "pi", "channel.mjs"),
++			'import { writeFileSync } from "node:fs"; writeFileSync("record.json", JSON.stringify(process.argv.slice(2)));',
++		);
++		expect(await runManagedChannelUpdate(true, { ...helpers(), spawn, waitForChildProcess })).toBe(true);
++		expect(JSON.parse(readFileSync(join(dir, "record.json"), "utf8"))).toEqual(["update", "--force"]);
++	});
++});
+diff --git c/packages/coding-agent/test/managed-update-routing.test.ts w/packages/coding-agent/test/managed-update-routing.test.ts
+new file mode 100644
+index 0000000..e2394f9
+--- /dev/null
++++ w/packages/coding-agent/test/managed-update-routing.test.ts
+@@ -0,0 +1,109 @@
++import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { ENV_AGENT_DIR, VERSION } from "../src/config.ts";
++import * as channel from "../src/core/managed-update-channel.ts";
++import { ModelRuntime } from "../src/core/model-runtime.ts";
++import { DefaultPackageManager } from "../src/core/package-manager.ts";
++import { handlePackageCommand, updateTargetIncludesSelf } from "../src/package-manager-cli.ts";
++import { allowNetwork } from "./test-network-env.ts";
++
++describe("managed update routing", () => {
++	let dir: string;
++	let exitCode: typeof process.exitCode;
++	beforeEach(() => {
++		allowNetwork();
++		dir = mkdtempSync(join(tmpdir(), "pi-channel-routing-"));
++		exitCode = process.exitCode;
++		process.exitCode = undefined;
++		vi.stubEnv(ENV_AGENT_DIR, dir);
++		vi.stubEnv("PI_PACKAGE_DIR", dir);
++		vi.spyOn(console, "log").mockImplementation(() => {});
++		vi.spyOn(console, "error").mockImplementation(() => {});
++		vi.stubGlobal(
++			"fetch",
++			vi.fn(() => {
++				throw new Error("Unexpected network request");
++			}),
++		);
++	});
++	afterEach(() => {
++		vi.restoreAllMocks();
++		vi.unstubAllEnvs();
++		vi.unstubAllGlobals();
++		process.exitCode = exitCode;
++		rmSync(dir, { recursive: true, force: true });
++	});
++
++	it("includes self when the update target is undefined", () => {
++		expect(updateTargetIncludesSelf(undefined)).toBe(true);
++	});
++
++	it.each([[], ["--self"], ["self"], ["pi"], ["--force"]].map((args) => ({ args })))(
++		"routes self $args once",
++		async ({ args }) => {
++			const run = vi.spyOn(channel, "runManagedChannelUpdate").mockResolvedValue(true);
++			const update = vi.spyOn(DefaultPackageManager.prototype, "update").mockResolvedValue();
++			expect(await handlePackageCommand(["update", ...args])).toBe(true);
++			expect(run).toHaveBeenCalledExactlyOnceWith(args.includes("--force"));
++			expect(update).not.toHaveBeenCalled();
++			expect(fetch).not.toHaveBeenCalled();
++		},
++	);
++
++	it.each([["--all"], ["--self", "--extensions"], ["pi", "--extensions", "--force"]].map((args) => ({ args })))(
++		"routes all $args and still updates extensions without stock self-update",
++		async ({ args }) => {
++			const run = vi.spyOn(channel, "runManagedChannelUpdate").mockResolvedValue(true);
++			const update = vi.spyOn(DefaultPackageManager.prototype, "update").mockResolvedValue();
++			await handlePackageCommand(["update", ...args]);
++			expect(run).toHaveBeenCalledExactlyOnceWith(args.includes("--force"));
++			expect(update).toHaveBeenCalledExactlyOnceWith(undefined);
++			expect(fetch).not.toHaveBeenCalled();
++			expect(process.exitCode).toBeUndefined();
++		},
++	);
++
++	it.each(["--extensions", "npm:example", "--models"])("leaves %s stock even with a broken marker", async (arg) => {
++		writeFileSync(join(dir, "hempi-channel.json"), "{");
++		const run = vi.spyOn(channel, "runManagedChannelUpdate");
++		const update = vi.spyOn(DefaultPackageManager.prototype, "update").mockResolvedValue();
++		const refresh = vi.fn(async () => ({ aborted: false, errors: new Map<string, Error>() }));
++		vi.spyOn(ModelRuntime, "create").mockResolvedValue({ refresh } as unknown as ModelRuntime);
++		await handlePackageCommand(["update", arg]);
++		expect(run).not.toHaveBeenCalled();
++		if (arg === "--models") expect(refresh).toHaveBeenCalledOnce();
++		else expect(update).toHaveBeenCalledExactlyOnceWith(arg === "--extensions" ? undefined : arg);
++		expect(process.exitCode).toBeUndefined();
++	});
++
++	it("retains stock self-update when no marker exists", async () => {
++		vi.stubGlobal(
++			"fetch",
++			vi.fn(async () => Response.json({ version: VERSION })),
++		);
++		await handlePackageCommand(["update"]);
++		expect(fetch).toHaveBeenCalledOnce();
++		expect(process.exitCode).toBeUndefined();
++	});
++
++	it("propagates channel failure without running extensions or stock updater", async () => {
++		vi.spyOn(channel, "runManagedChannelUpdate").mockRejectedValue(new Error("exited with code 23"));
++		const update = vi.spyOn(DefaultPackageManager.prototype, "update").mockResolvedValue();
++		await handlePackageCommand(["update", "--all"]);
++		expect(process.exitCode).toBe(1);
++		expect(update).not.toHaveBeenCalled();
++		expect(fetch).not.toHaveBeenCalled();
++		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("exited with code 23"));
++	});
++
++	it.each(["--self", "--all"])("fails closed for broken marker %s", async (target) => {
++		writeFileSync(join(dir, "hempi-channel.json"), "{");
++		const update = vi.spyOn(DefaultPackageManager.prototype, "update").mockResolvedValue();
++		await handlePackageCommand(["update", target]);
++		expect(process.exitCode).toBe(1);
++		expect(update).not.toHaveBeenCalled();
++		expect(fetch).not.toHaveBeenCalled();
++	});
++});

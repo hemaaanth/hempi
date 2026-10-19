@@ -1,0 +1,346 @@
+diff --git a/packages/coding-agent/src/modes/interactive/chat-transcript.ts b/packages/coding-agent/src/modes/interactive/chat-transcript.ts
+index 417e38d..a68b295 100644
+--- a/packages/coding-agent/src/modes/interactive/chat-transcript.ts
++++ b/packages/coding-agent/src/modes/interactive/chat-transcript.ts
+@@ -32,7 +32,10 @@ export class ChatTranscript extends Container {
+ 	}
+ 
+ 	settle(): boolean {
+-		const failed = [...this.unsettled].some((child) => child instanceof AssistantMessageComponent && child.isFailure);
++		const last = this.children.findLast(
++			(child) => child instanceof AssistantMessageComponent && this.unsettled.has(child),
++		);
++		const failed = last instanceof AssistantMessageComponent && last.isFailure;
+ 		this.running = false;
+ 		this.unsettled.clear();
+ 		return failed;
+@@ -63,7 +66,7 @@ export class ChatTranscript extends Container {
+ 		const finals = new Set<Component>();
+ 		let last: AssistantMessageComponent | undefined;
+ 		const finish = () => {
+-			if (last?.isFinalReply && !this.unsettled.has(last)) finals.add(last);
++			if (last && (last.isFinalReply || last.isFailure) && !this.unsettled.has(last)) finals.add(last);
+ 			last = undefined;
+ 		};
+ 		for (const [index, child] of this.children.entries()) {
+@@ -85,7 +88,7 @@ export class ChatTranscript extends Container {
+ 		this.visible.children = children.filter((child) => {
+ 			if (child instanceof AssistantMessageComponent) {
+ 				child.setChatOnly(this.chatOnly);
+-				return !this.chatOnly || finals.has(child) || child.isFailure;
++				return !this.chatOnly || finals.has(child);
+ 			}
+ 			return !this.chatOnly || child instanceof UserMessageComponent || this.notices.has(child);
+ 		});
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index e6af661..3196de6 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -3677,7 +3677,6 @@ export class InteractiveMode {
+ 				const component = this.pendingTools.get(event.toolCallId);
+ 				if (component) {
+ 					component.updateResult({ ...event.result, isError: event.isError, durationMs: event.durationMs });
+-					if (event.isError) this.chatContainer.keepVisible(component);
+ 					this.pendingTools.delete(event.toolCallId);
+ 					this.ui.requestRender();
+ 				}
+@@ -3774,7 +3773,7 @@ export class InteractiveMode {
+ 						const errorMessage = event.errorMessage;
+ 						const component = new ThemedText(() => theme.fg("error", errorMessage), 1, 0);
+ 						this.chatContainer.addChild(component);
+-						this.chatContainer.keepVisible?.(component);
++						if (!event.willRetry) this.chatContainer.keepVisible?.(component);
+ 					}
+ 				}
+ 				void this.flushCompactionQueue({ willRetry: event.willRetry });
+@@ -3811,7 +3810,7 @@ export class InteractiveMode {
+ 			}
+ 
+ 			case "summarization_retry_scheduled": {
+-				this.showError(event.errorMessage);
++				this.showError(event.errorMessage, false);
+ 				this.showStatusIndicator(
+ 					new RetryStatusIndicator(this.ui, event.attempt, event.maxAttempts, event.delayMs),
+ 				);
+@@ -4134,7 +4133,6 @@ export class InteractiveMode {
+ 				const component = renderedPendingTools.get(message.toolCallId);
+ 				if (component) {
+ 					component.updateResult(message);
+-					if (message.isError) this.chatContainer.keepVisible?.(component);
+ 					renderedPendingTools.delete(message.toolCallId);
+ 				}
+ 			} else {
+@@ -4727,11 +4725,11 @@ export class InteractiveMode {
+ 		this.ui.requestRender();
+ 	}
+ 
+-	showError(errorMessage: string): void {
++	showError(errorMessage: string, quietVisible = true): void {
+ 		this.chatContainer.addChild(new Spacer(1));
+ 		const component = new ThemedText(() => theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0);
+ 		this.chatContainer.addChild(component);
+-		this.chatContainer.keepVisible?.(component);
++		if (quietVisible) this.chatContainer.keepVisible?.(component);
+ 		this.ui.requestRender();
+ 	}
+ 
+diff --git a/packages/coding-agent/test/chat-transcript.test.ts b/packages/coding-agent/test/chat-transcript.test.ts
+index 3cec155..663f180 100644
+--- a/packages/coding-agent/test/chat-transcript.test.ts
++++ b/packages/coding-agent/test/chat-transcript.test.ts
+@@ -45,14 +45,15 @@ function message(text: string, stopReason: AssistantMessage["stopReason"] = "sto
+ const output = (chat: ChatTranscript, width = 80) => stripAnsi(chat.render(width).join("\n"));
+ 
+ for (const reason of ["error", "aborted", "length"] as const) {
+-	test(`keeps ${reason} visible even when it contains a tool call`, () => {
++	test(`reveals terminal ${reason} at settlement even when it contains a tool call`, () => {
+ 		initTheme("dark");
+ 		const chat = new ChatTranscript();
+ 		chat.beginRun();
+ 		chat.addChild(new AssistantMessageComponent(message("PARTIAL", reason, true)));
++		expect(chat.render(80)).toEqual([]);
++		expect(chat.settle()).toBe(true);
+ 		expect(output(chat)).toMatch(/Error:|Operation aborted|truncated/);
+ 		expect(output(chat)).not.toContain("SECRET_THOUGHT");
+-		expect(chat.settle()).toBe(true);
+ 	});
+ }
+ 
+diff --git a/packages/coding-agent/test/internal-error-visibility.test.ts b/packages/coding-agent/test/internal-error-visibility.test.ts
+new file mode 100644
+index 0000000..def98ef
+--- /dev/null
++++ b/packages/coding-agent/test/internal-error-visibility.test.ts
+@@ -0,0 +1,232 @@
++import {
++	type AssistantMessage,
++	fauxAssistantMessage,
++	type ToolCall,
++	type ToolResultMessage,
++} from "@earendil-works/pi-ai";
++import { describe, expect, test, vi } from "vitest";
++import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
++import { createBashToolDefinition } from "../src/core/tools/bash.ts";
++import { createEditToolDefinition } from "../src/core/tools/edit.ts";
++import { ChatTranscript } from "../src/modes/interactive/chat-transcript.ts";
++import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
++import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
++import { UserMessageComponent } from "../src/modes/interactive/components/user-message.ts";
++import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
++import { initTheme } from "../src/modes/interactive/theme/theme.ts";
++import { createInteractiveTui } from "../src/modes/interactive/tui-renderer.ts";
++import { stripAnsi } from "../src/utils/ansi.ts";
++
++const invoke = (target: object, method: string, ...args: unknown[]) =>
++	Reflect.apply(Reflect.get(InteractiveMode.prototype, method), target, args);
++const output = (chat: ChatTranscript) => stripAnsi(chat.render(100).join("\n"));
++
++for (const tuiMode of ["regular", "fullscreen"] as const) {
++	for (const path of ["live", "replay"] as const) {
++		test(`${tuiMode} ${path}: internal rg/edit failures and successful retries stay details-only`, async () => {
++			initTheme("dark");
++			const terminal = new VirtualTerminal(100, 60);
++			const ui = createInteractiveTui({ tuiMode, terminal, showHardwareCursor: false, logDirectory: "/tmp" });
++			const chat = new ChatTranscript();
++			ui.addChild(chat);
++			const definitions = { bash: createBashToolDefinition("/tmp"), edit: createEditToolDefinition("/tmp") };
++			const context = {
++				isInitialized: true,
++				chatContainer: chat,
++				ui,
++				outputPad: 1,
++				hideThinkingBlock: false,
++				pendingTools: new Map<string, ToolExecutionComponent>(),
++				toolOutputExpanded: true,
++				footer: { invalidate: vi.fn() },
++				programStatus: { handleEvent: vi.fn() },
++				settingsManager: {
++					getShowImages: () => false,
++					getImageWidthCells: () => 60,
++					getShowCacheMissNotices: () => false,
++				},
++				sessionManager: { getCwd: () => "/tmp" },
++				getRegisteredToolDefinition: (name: keyof typeof definitions) => definitions[name],
++				getMarkdownThemeWithSettings: () => undefined,
++				getMarkdownTransformers: () => [],
++				getUserMessageText: Reflect.get(InteractiveMode.prototype, "getUserMessageText"),
++				addMessageToChat: Reflect.get(InteractiveMode.prototype, "addMessageToChat"),
++				maybeShowInstallChangeWarning: vi.fn(),
++			};
++			const messages: Array<AssistantMessage | ToolResultMessage> = [];
++			chat.addChild(new UserMessageComponent("INPUT"));
++			if (path === "live") chat.beginRun();
++			ui.start();
++			try {
++				for (const [index, name] of ["bash", "edit", "edit"].entries()) {
++					const id = `call_${index}`;
++					const args: ToolCall["arguments"] =
++						name === "bash"
++							? { command: "rg missing file" }
++							: { path: "/tmp/pi-error-visibility-missing", edits: [{ oldText: "x", newText: "y" }] };
++					const text = [
++						"Command exited with code 1",
++						"oldText must match a unique occurrence",
++						"Successfully replaced text",
++					][index];
++					const call = fauxAssistantMessage([{ type: "toolCall", id, name, arguments: args }], {
++						stopReason: "toolUse",
++					});
++					const result: ToolResultMessage = {
++						role: "toolResult",
++						toolCallId: id,
++						toolName: name,
++						content: [{ type: "text", text }],
++						isError: index < 2,
++						timestamp: index,
++					};
++					messages.push(call, result);
++					const original = structuredClone(messages);
++					if (path === "live") {
++						chat.addChild(new AssistantMessageComponent(call));
++						await invoke(context, "handleEvent", {
++							type: "tool_execution_start",
++							toolCallId: id,
++							toolName: name,
++							args,
++						});
++						await invoke(context, "handleEvent", {
++							type: "tool_execution_end",
++							toolCallId: id,
++							result,
++							isError: result.isError,
++						});
++					} else invoke(context, "renderSessionItems", [call, result]);
++					expect(messages).toEqual(original);
++					expect(chat.render(100)).toEqual(new UserMessageComponent("INPUT").render(100));
++					await terminal.waitForRender();
++					expect(terminal.getViewport().join("\n")).not.toContain(text);
++				}
++				const final = fauxAssistantMessage("FINAL_SUCCESS");
++				messages.push(final);
++				const originalMessages = structuredClone(messages);
++				invoke(context, "addMessageToChat", final);
++				expect(chat.settle()).toBe(false);
++				const originalChildren = [...chat.children];
++				expect(chat.children.filter((child) => child instanceof ToolExecutionComponent)).toHaveLength(3);
++				const quiet = chat.render(100);
++				const expected = new ChatTranscript();
++				expected.addChild(new UserMessageComponent("INPUT"));
++				expected.addChild(new AssistantMessageComponent(final));
++				expect(quiet).toEqual(expected.render(100));
++				chat.chatOnly = false;
++				ui.requestRender(true);
++				await terminal.waitForRender();
++				const details = output(chat);
++				for (const error of ["Command exited with code 1", "oldText must match a unique occurrence"]) {
++					expect(details).toContain(error);
++					expect(terminal.getViewport().join("\n")).toContain(error);
++				}
++				chat.chatOnly = true;
++				ui.requestRender(true);
++				await terminal.waitForRender();
++				expect(chat.render(100)).toEqual(quiet);
++				expect(terminal.getViewport().join("\n")).toContain("FINAL_SUCCESS");
++				expect(chat.children).toEqual(originalChildren);
++				expect(messages).toEqual(originalMessages);
++			} finally {
++				ui.stop();
++			}
++		});
++	}
++}
++
++describe("assistant attempt settlement", () => {
++	for (const reason of ["error", "aborted", "length"] as const) {
++		test(`${reason}: recovered attempts are hidden live and on replay, terminal failures survive`, () => {
++			initTheme("dark");
++			const chat = new ChatTranscript();
++			const failure = fauxAssistantMessage("FAILED_ATTEMPT", {
++				stopReason: reason,
++				errorMessage: "PROVIDER_FAILURE",
++			});
++			const success = fauxAssistantMessage("FINAL_SUCCESS");
++			const messages = structuredClone([failure, success]);
++			chat.beginRun();
++			chat.addChild(new AssistantMessageComponent(failure));
++			expect(chat.render(100)).toEqual([]);
++			chat.addChild(new AssistantMessageComponent(success));
++			expect(chat.settle()).toBe(false);
++			expect(output(chat)).toContain("FINAL_SUCCESS");
++			expect(output(chat)).not.toContain("FAILED_ATTEMPT");
++			const replay = new ChatTranscript();
++			for (const message of [failure, success]) replay.addChild(new AssistantMessageComponent(message));
++			expect(replay.render(100)).toEqual(chat.render(100));
++			chat.chatOnly = false;
++			expect(output(chat)).toContain("FAILED_ATTEMPT");
++			expect([failure, success]).toEqual(messages);
++			chat.clear();
++			chat.chatOnly = true;
++			chat.beginRun();
++			chat.addChild(new AssistantMessageComponent(failure));
++			expect(chat.settle()).toBe(true);
++			expect(output(chat)).toContain("FAILED_ATTEMPT");
++			chat.beginRun();
++			const removed = new AssistantMessageComponent(failure);
++			chat.addChild(removed);
++			chat.removeChild(removed);
++			expect(chat.settle()).toBe(false);
++		});
++	}
++});
++
++test("native transient retry notices are details-only; terminal and manual errors remain actionable", async () => {
++	initTheme("dark");
++	const chat = new ChatTranscript();
++	const context = {
++		isInitialized: true,
++		chatContainer: chat,
++		outputPad: 1,
++		footer: { invalidate: vi.fn() },
++		programStatus: { handleEvent: vi.fn() },
++		ui: { requestRender: vi.fn() },
++		defaultEditor: {},
++		settingsManager: { getShowTerminalProgress: () => false },
++		showError: Reflect.get(InteractiveMode.prototype, "showError"),
++		showStatusIndicator: (indicator: { dispose(): void }) => indicator.dispose(),
++		clearStatusIndicator: vi.fn(),
++		flushCompactionQueue: vi.fn(),
++	};
++	await invoke(context, "handleEvent", {
++		type: "summarization_retry_scheduled",
++		errorMessage: "TRANSIENT_SUMMARY",
++		attempt: 1,
++		maxAttempts: 3,
++		delayMs: 1,
++	});
++	await invoke(context, "handleEvent", {
++		type: "compaction_end",
++		reason: "overflow",
++		aborted: false,
++		willRetry: true,
++		errorMessage: "TRANSIENT_COMPACTION",
++	});
++	expect(chat.render(100)).toEqual([]);
++	chat.chatOnly = false;
++	expect(output(chat)).toContain("TRANSIENT_SUMMARY");
++	expect(output(chat)).toContain("TRANSIENT_COMPACTION");
++	chat.chatOnly = true;
++	await invoke(context, "handleEvent", {
++		type: "compaction_end",
++		reason: "overflow",
++		aborted: false,
++		willRetry: false,
++		errorMessage: "TERMINAL_COMPACTION",
++	});
++	await invoke(context, "handleEvent", { type: "compaction_end", reason: "manual", aborted: true, willRetry: false });
++	await invoke(context, "handleEvent", {
++		type: "auto_retry_end",
++		success: false,
++		attempt: 3,
++		finalError: "TERMINAL_RETRY",
++	});
++	expect(output(chat)).toContain("TERMINAL_COMPACTION");
++	expect(output(chat)).toContain("Compaction cancelled");
++	expect(output(chat)).toContain("TERMINAL_RETRY");
++	expect(output(chat)).not.toContain("TRANSIENT_");
++});
